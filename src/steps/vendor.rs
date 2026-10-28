@@ -145,9 +145,9 @@ pub async fn generate_vendor_tarball_clean(
             .collect();
 
         if !stale.is_empty() {
-            println!("  Removing stale vendor tarballs from previous series builds:");
+            crate::shell::out_line("  Removing stale vendor tarballs from previous series builds:");
             for path in &stale {
-                println!("    {}", path.display());
+                crate::shell::out_line(&format!("    {}", path.display()));
                 std::fs::remove_file(path).map_err(ThermiteError::Io)?;
             }
         }

@@ -8,7 +8,6 @@ use std::path::Path;
 use crate::error::{Result, ThermiteError};
 use crate::steps::changelog::read_current_version;
 use crate::types::package_version::RustcPackageVersion;
-use crate::types::ubuntu::UbuntuRelease;
 use crate::types::versions::RustVersion;
 
 // ---------------------------------------------------------------------------
@@ -119,48 +118,7 @@ pub fn run_bump(input: Option<&str>, operation: &BumpOperation, json: bool) -> R
     let version_str = resolve_version_input(input)?;
     let mut v = RustcPackageVersion::parse(&version_str)?;
 
-    match operation {
-        BumpOperation::PatchRelease { upstream } => {
-            let new_upstream = RustVersion::parse(upstream)?;
-            v.bump_patch_release(new_upstream);
-        }
-        BumpOperation::UbuntuRevision => {
-            v.bump_ubuntu_revision();
-        }
-        BumpOperation::Repack => {
-            v.bump_repack();
-        }
-        BumpOperation::Backport { series, release } => {
-            let resolved =
-                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
-                    ThermiteError::InvalidRustVersion(
-                        "backport operation requires --series or --release".to_owned(),
-                    )
-                })?;
-            v.to_backport(&resolved);
-        }
-        BumpOperation::BackportRevision => {
-            v.bump_backport_revision();
-        }
-        BumpOperation::BackportRepack => {
-            v.bump_backport_repack();
-        }
-        BumpOperation::Retarget { series, release } => {
-            let resolved =
-                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
-                    ThermiteError::InvalidRustVersion(
-                        "retarget operation requires --series or --release".to_owned(),
-                    )
-                })?;
-            v.retarget_series(&resolved);
-        }
-        BumpOperation::Ppa => {
-            v.bump_ppa();
-        }
-        BumpOperation::ClearPpa => {
-            v.clear_ppa();
-        }
-    }
+    apply_bump_operation(&mut v, operation)?;
 
     if json {
         let output =
@@ -206,56 +164,11 @@ pub fn resolve_version_input(input: Option<&str>) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Bump operation enum (used by bin/thermite.rs CLI)
+// Bump operations (re-exported from types/package_version.rs)
 // ---------------------------------------------------------------------------
 
-/// The bump operation to perform.
-#[derive(Debug, Clone)]
-pub enum BumpOperation {
-    /// New upstream patch release — resets all fields.
-    PatchRelease { upstream: String },
-    /// Increment the Ubuntu revision.
-    UbuntuRevision,
-    /// Increment the repack number (resets Ubuntu revision).
-    Repack,
-    /// Generate a backport version (sets series, backport_revision=1).
-    Backport {
-        series: Option<String>,
-        release: Option<String>,
-    },
-    /// Increment the backport revision.
-    BackportRevision,
-    /// Increment the backport repack (resets backport revision).
-    BackportRepack,
-    /// Retarget a backport to a different series.
-    Retarget {
-        series: Option<String>,
-        release: Option<String>,
-    },
-    /// Increment the PPA number (for PPA upload iteration).
-    Ppa,
-    /// Remove the PPA suffix (for final archive upload).
-    ClearPpa,
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Resolve a series from `--series` or `--release` (mutually exclusive).
-fn resolve_series(series: Option<&str>, release: Option<&str>) -> Result<Option<String>> {
-    match (series, release) {
-        (Some(_), Some(_)) => Err(ThermiteError::InvalidRustVersion(
-            "--series and --release are mutually exclusive".to_owned(),
-        )),
-        (Some(s), None) => Ok(Some(s.to_owned())),
-        (None, Some(r)) => {
-            let ubuntu_release = UbuntuRelease::parse(r)?;
-            Ok(Some(ubuntu_release.series_number().to_owned()))
-        }
-        (None, None) => Ok(None),
-    }
-}
+pub use crate::types::package_version::BumpOperation;
+use crate::types::package_version::{apply_bump_operation, resolve_series};
 
 /// Print the parsed version in human-readable key-value format.
 fn print_parsed(v: &RustcPackageVersion) {

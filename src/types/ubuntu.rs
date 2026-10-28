@@ -145,6 +145,15 @@ impl UbuntuRelease {
         };
         year.is_multiple_of(2) && month == "04"
     }
+
+    /// Reverse lookup: the release adjective for a numeric series
+    /// (`"24.04"` → `"noble"`), or `None` for an unknown series.
+    pub fn release_from_series(series: &str) -> Option<&'static str> {
+        KNOWN_RELEASES
+            .iter()
+            .find(|(_, s)| *s == series)
+            .map(|(name, _)| *name)
+    }
 }
 
 impl std::fmt::Display for UbuntuRelease {

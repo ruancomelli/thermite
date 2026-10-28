@@ -2,6 +2,8 @@ use std::io::{self, Write};
 
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 
+use crate::shell;
+
 /// Returns `true` when stdout is an interactive terminal.
 ///
 /// When `false` (piped, redirected, or a dumb terminal), all ANSI escape codes
@@ -11,21 +13,34 @@ fn is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
+/// Returns `true` when running under the TUI (output sink active).
+///
+/// In TUI mode the alternate screen is owned by the ratatui event loop, so:
+/// - ANSI escape codes are suppressed (they would render as garbage in the
+///   log pane),
+/// - interactive prompts must not touch the terminal.
+fn is_tui() -> bool {
+    shell::is_sink_active()
+}
+
 /// Print a formatted phase header banner to stdout.
 ///
 /// On a TTY the title is rendered as a bold reverse-video (inverted) banner,
 /// which is visually prominent without emitting any decorative characters that
 /// a screen reader would enumerate.  On non-TTY output the plain text title is
-/// printed instead.
+/// printed instead.  Under the TUI the plain text goes into the log pane.
 pub fn print_phase_header(phase: u32, title: &str) {
     let label = format!("  THERMITE \u{2014} Phase {phase}: {title}");
-    if is_tty() {
+    if is_tui() {
+        shell::out_line("");
+        shell::out_line(&label);
+    } else if is_tty() {
         // Pad to a fixed display width and wrap in bold + reverse-video.
         // \x1b[1m = bold, \x1b[7m = reverse video, \x1b[0m = reset.
         let padded = format!("{label:<70}");
-        println!("\n\x1b[1m\x1b[7m{padded}\x1b[0m");
+        shell::out_line(&format!("\n\x1b[1m\x1b[7m{padded}\x1b[0m"));
     } else {
-        println!("\n{label}");
+        shell::out_line(&format!("\n{label}"));
     }
 }
 
@@ -39,20 +54,20 @@ pub fn print_phase_header(phase: u32, title: &str) {
 /// Call this after [`crate::commands::backport::print_phase_explanation`] and before the parameters box
 /// so the user sees every check result before being asked to confirm.
 pub fn print_tool_checks(checks: &[(&str, bool)]) {
-    if is_tty() {
-        println!("\x1b[1m  Required tools\x1b[0m");
+    if is_tty() && !is_tui() {
+        shell::out_line("\x1b[1m  Required tools\x1b[0m");
     } else {
-        println!("  Required tools");
+        shell::out_line("  Required tools");
     }
-    println!();
+    shell::out_line("");
     for (name, found) in checks {
         if *found {
-            println!("    \u{2714} {name}");
+            shell::out_line(&format!("    \u{2714} {name}"));
         } else {
-            println!("    \u{2717} {name}");
+            shell::out_line(&format!("    \u{2717} {name}"));
         }
     }
-    println!();
+    shell::out_line("");
 }
 
 /// Print a formatted info box with a title and body lines.
@@ -62,23 +77,23 @@ pub fn print_tool_checks(checks: &[(&str, bool)]) {
 /// screen readers, and free of decorative box-drawing characters.
 pub fn print_info_box(title: &str, lines: &[&str]) {
     let width = 66usize;
-    if is_tty() {
+    if is_tty() && !is_tui() {
         // \x1b[1m = bold, \x1b[0m = reset.
-        println!("\x1b[1m  {title}\x1b[0m");
+        shell::out_line(&format!("\x1b[1m  {title}\x1b[0m"));
     } else {
-        println!("  {title}");
+        shell::out_line(&format!("  {title}"));
     }
-    println!();
+    shell::out_line("");
     for line in lines {
         if line.is_empty() {
-            println!();
+            shell::out_line("");
         } else {
             for chunk in wrap_line(line, width - 4) {
-                println!("    {chunk}");
+                shell::out_line(&format!("    {chunk}"));
             }
         }
     }
-    println!();
+    shell::out_line("");
 }
 
 /// Wrap a single line to at most `max_width` *characters* per chunk.
@@ -152,7 +167,14 @@ fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
 /// This is intentionally a plain readline prompt rather than a dialoguer
 /// primitive — dialoguer has no "press Enter to continue" type, and the simple
 /// implementation is correct and sufficient here.
+///
+/// Under the TUI there is no stdin to wait on, so the message is logged and
+/// the function returns immediately.
 pub fn prompt_continue(message: &str) {
+    if is_tui() {
+        shell::out_line(&format!("  {message}"));
+        return;
+    }
     print!("\n  {message} [Press Enter to continue] ");
     io::stdout().flush().ok();
     let mut buf = String::new();
@@ -164,7 +186,16 @@ pub fn prompt_continue(message: &str) {
 /// Returns `true` if the user answers `y` or `yes` (case-insensitive). Any
 /// other input (including Enter alone) returns `false`, making the default
 /// safe-conservative "no". The `[y/N]` suffix makes the default visible.
+///
+/// Under the TUI the question is logged and the conservative default
+/// (`false`) is returned.
 pub fn prompt_yes_no(question: &str) -> bool {
+    if is_tui() {
+        shell::out_line(&format!(
+            "  {question} [y/N] (auto-answer: no under the TUI)"
+        ));
+        return false;
+    }
     print!("\n  {question} [y/N] ");
     io::stdout().flush().ok();
     let mut buf = String::new();
@@ -174,7 +205,14 @@ pub fn prompt_yes_no(question: &str) -> bool {
 
 /// Prompt the user for a line of free-form text input. Returns the trimmed
 /// string. Falls back to an empty string if the terminal is not interactive.
+///
+/// Under the TUI the prompt is logged and an empty string is returned; TUI
+/// interactions use their own ratatui modal input instead.
 pub fn prompt_input(prompt: &str) -> String {
+    if is_tui() {
+        shell::out_line(&format!("  {prompt} (auto-answer: empty under the TUI)"));
+        return String::new();
+    }
     println!();
     Input::<String>::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
@@ -190,7 +228,20 @@ pub fn prompt_input(prompt: &str) -> String {
 ///
 /// `default` is the index pre-highlighted when the menu opens. Falls back to
 /// `default` if the terminal is not interactive.
+///
+/// Under the TUI the menu cannot be rendered inside the alternate screen
+/// (raw mode is owned by the ratatui event loop), so the menu is logged and
+/// the default index is returned — the same fallback as non-TTY mode.
 pub fn prompt_select(prompt: &str, options: &[&str], default: usize) -> usize {
+    if is_tui() {
+        shell::out_line(&format!(
+            "  {prompt} (auto-selecting the default under the TUI)"
+        ));
+        for (i, option) in options.iter().enumerate() {
+            shell::out_line(&format!("    {i}. {option}"));
+        }
+        return default;
+    }
     println!();
     Select::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
@@ -222,10 +273,10 @@ pub fn prompt_select(prompt: &str, options: &[&str], default: usize) -> usize {
 /// ```
 pub fn confirm_sink(dry_run: bool, description: &str, target_lines: &[&str]) -> bool {
     if dry_run {
-        println!("\n  [dry-run] SKIP: {description}");
+        shell::out_line(&format!("\n  [dry-run] SKIP: {description}"));
         for line in target_lines {
             if !line.trim().is_empty() {
-                println!("            {line}");
+                shell::out_line(&format!("            {line}"));
             }
         }
         return false;
@@ -243,13 +294,21 @@ pub fn confirm_sink(dry_run: bool, description: &str, target_lines: &[&str]) -> 
 /// Call this immediately after printing a "Retrying in X seconds" message.
 pub async fn countdown_secs(secs: u64) {
     for remaining in (1..=secs).rev() {
-        print!("\r  {remaining:3}s remaining...   ");
-        io::stdout().flush().ok();
+        if is_tui() {
+            // The `\r` line-rewriting below would only corrupt the log pane;
+            // emit one plain line per second instead.
+            shell::out_line(&format!("  {remaining:3}s remaining..."));
+        } else {
+            print!("\r  {remaining:3}s remaining...   ");
+            io::stdout().flush().ok();
+        }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-    // Erase the countdown line so subsequent output starts cleanly.
-    print!("\r{:30}\r", "");
-    io::stdout().flush().ok();
+    if !is_tui() {
+        // Erase the countdown line so subsequent output starts cleanly.
+        print!("\r{:30}\r", "");
+        io::stdout().flush().ok();
+    }
 }
 
 #[cfg(test)]

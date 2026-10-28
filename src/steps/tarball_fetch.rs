@@ -176,11 +176,11 @@ pub async fn fetch_tarball(
                 ));
             }
         }
-        Err(_) => println!("  rmadison failed — skipping Ubuntu archive candidates"),
+        Err(_) => crate::shell::out_line("  rmadison failed — skipping Ubuntu archive candidates"),
     }
 
     for (url, label) in &candidates {
-        println!("  Trying {label} …");
+        crate::shell::out_line(&format!("  Trying {label} …"));
         match download_to_file(url, &dest).await {
             Ok(()) => {
                 if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
@@ -189,7 +189,9 @@ pub async fn fetch_tarball(
                 let _ = std::fs::remove_file(&dest);
             }
             Err(ThermiteError::CommandNotFound(_)) => {
-                println!("  Neither wget nor curl found — cannot download automatically.");
+                crate::shell::out_line(
+                    "  Neither wget nor curl found — cannot download automatically.",
+                );
                 break;
             }
             Err(_) => {

@@ -9,11 +9,18 @@ path = "src/bin/thermite.rs"
 
 [dependencies]
 anyhow = "1"
+crossterm = { version = "0.29", optional = true, features = ["event-stream"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.12"
+ratatui = { version = "0.30", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Terminal user interface (`thermite tui`). Requires ratatui + crossterm.
+tui = ["dep:ratatui", "dep:crossterm"]

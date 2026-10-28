@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::error::{Result, ThermiteError};
+use crate::shell;
 use crate::steps::{overlay, tarball_fetch, uscan, vendor};
 use crate::types::params::{TarballAction, TarballParams};
 use crate::ui::{print_info_box, print_phase_header, prompt_select};
@@ -84,7 +85,10 @@ async fn download_orig(params: &TarballParams, parent_dir: &Path) -> Result<Path
     let expected = expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::Orig);
 
     if expected.exists() {
-        println!("  Orig tarball already present: {}", expected.display());
+        shell::out_line(&format!(
+            "  Orig tarball already present: {}",
+            expected.display()
+        ));
         return Ok(expected);
     }
 
@@ -109,7 +113,7 @@ async fn download_orig(params: &TarballParams, parent_dir: &Path) -> Result<Path
     )
     .await?;
     if fetched.is_none() {
-        println!("  Automated download unavailable — place the tarball manually.");
+        shell::out_line("  Automated download unavailable — place the tarball manually.");
         if prompt_select(
             "Place the tarball at the path shown above, then continue.",
             &["I've placed the tarball — continue", "Abort"],
@@ -151,7 +155,10 @@ async fn download_vendor(params: &TarballParams, parent_dir: &Path) -> Result<Pa
         expected_tarball_path(params, parent_dir, tarball_fetch::TarballKind::OrigVendor);
 
     if expected.exists() {
-        println!("  Vendor tarball already present: {}", expected.display());
+        shell::out_line(&format!(
+            "  Vendor tarball already present: {}",
+            expected.display()
+        ));
         return Ok(expected);
     }
 
@@ -176,7 +183,7 @@ async fn download_vendor(params: &TarballParams, parent_dir: &Path) -> Result<Pa
     )
     .await?;
     if fetched.is_none() {
-        println!("  Automated download unavailable — place the vendor tarball manually.");
+        shell::out_line("  Automated download unavailable — place the vendor tarball manually.");
         if prompt_select(
             "Place the vendor tarball at the path shown above, then continue.",
             &["I've placed the vendor tarball — continue", "Abort"],
@@ -286,7 +293,10 @@ async fn overlay_orig(
     parent_dir: &Path,
 ) -> Result<PathBuf> {
     let tarball = locate_expected_tarball(params, parent_dir, tarball_fetch::TarballKind::Orig)?;
-    println!("  Overlaying orig tarball into {} …", repo_dir.display());
+    shell::out_line(&format!(
+        "  Overlaying orig tarball into {} …",
+        repo_dir.display()
+    ));
     overlay::overlay_orig_tarball(&tarball, repo_dir).await?;
     Ok(tarball)
 }
@@ -305,10 +315,10 @@ async fn overlay_vendor(
     } else {
         "merge"
     };
-    println!(
+    shell::out_line(&format!(
         "  Overlaying vendor/ into {} ({mode}) …",
         repo_dir.display()
-    );
+    ));
     overlay::overlay_vendor_dir(&tarball, repo_dir, params.overlay_replace).await?;
     Ok(tarball)
 }
@@ -357,7 +367,7 @@ pub async fn run(params: &TarballParams, repo_dir: &Path, target: TarballTarget)
             TarballAction::Generate => generate_orig(params, repo_dir, &parent_dir).await?,
             TarballAction::Overlay => overlay_orig(params, repo_dir, &parent_dir).await?,
         };
-        println!("  Orig tarball: {}", tarball.display());
+        shell::out_line(&format!("  Orig tarball: {}", tarball.display()));
     }
 
     if target.wants_vendor() {
@@ -367,10 +377,11 @@ pub async fn run(params: &TarballParams, repo_dir: &Path, target: TarballTarget)
             TarballAction::Generate => generate_vendor(params, repo_dir, &parent_dir).await?,
             TarballAction::Overlay => overlay_vendor(params, repo_dir, &parent_dir).await?,
         };
-        println!("  Vendor tarball: {}", tarball.display());
+        shell::out_line(&format!("  Vendor tarball: {}", tarball.display()));
     }
 
-    println!("\nthermite tarball complete.");
+    shell::out_line("");
+    shell::out_line("thermite tarball complete.");
     Ok(())
 }
 

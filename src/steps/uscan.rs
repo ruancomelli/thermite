@@ -179,7 +179,9 @@ async fn run_uscan_staged(
     for attempt in 0_u32..4 {
         if attempt > 0 {
             let secs = RETRY_DELAYS[(attempt - 1) as usize];
-            println!("  Rate limit detected. Retrying in {secs} seconds . . .");
+            crate::shell::out_line(&format!(
+                "  Rate limit detected. Retrying in {secs} seconds . . ."
+            ));
             crate::ui::countdown_secs(secs).await;
         }
 
@@ -203,11 +205,11 @@ async fn run_uscan_staged(
 
                 let produced = find_produced_tarball(staging)?;
                 std::fs::rename(&produced, &final_path)?;
-                println!(
+                crate::shell::out_line(&format!(
                     "  uscan produced {} — moved to {}",
                     produced.display(),
                     final_path.display()
-                );
+                ));
                 return Ok(final_path);
             }
             Err(e) => {

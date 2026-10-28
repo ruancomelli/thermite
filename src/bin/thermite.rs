@@ -4,6 +4,8 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use thermite::commands::tarball::TarballTarget;
+#[cfg(feature = "tui")]
+use thermite::commands::tui;
 use thermite::commands::{backport, tarball, update, version};
 use thermite::error::{Result, ThermiteError};
 use thermite::shell;
@@ -110,6 +112,15 @@ enum Commands {
     Tarball {
         #[command(subcommand)]
         action: TarballCommands,
+    },
+
+    /// Interactive terminal UI over the packaging commands.
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Path to the root of the Debian source package (defaults to the
+        /// current working directory).
+        #[arg(short = 'd', long)]
+        repo_dir: Option<PathBuf>,
     },
 }
 
@@ -409,16 +420,22 @@ struct TarballOverlayVendorArgs {
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Install the default tracing subscriber writing to stdout.
+///
+/// The `thermite tui` command installs its own subscriber (output routed into
+/// the TUI log pane) instead, so this must not be called for that command.
+fn init_stdout_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    if let Err(e) = run().await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
 }
 
 /// Resolve the repo directory to an absolute canonical path.
@@ -469,6 +486,16 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     shell::set_verbosity(cli.verbose);
+
+    // The TUI installs its own tracing subscriber that routes output into the
+    // TUI log pane; every other command uses the plain stdout subscriber.
+    // (Enabling both would panic — `fmt::init` is once-only.)
+    #[cfg(not(feature = "tui"))]
+    init_stdout_tracing();
+    #[cfg(feature = "tui")]
+    if !matches!(cli.command, Commands::Tui { .. }) {
+        init_stdout_tracing();
+    }
 
     match cli.command {
         Commands::Update {
@@ -562,6 +589,12 @@ async fn run() -> Result<()> {
             let repo_path = resolve_repo_dir(repo_dir)?;
 
             tarball::run(&params, &repo_path, target).await?;
+        }
+
+        #[cfg(feature = "tui")]
+        Commands::Tui { repo_dir } => {
+            let repo_path = resolve_repo_dir(repo_dir)?;
+            tui::run(&repo_path).await?;
         }
     }
 

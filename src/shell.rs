@@ -1,9 +1,10 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info};
 
 use crate::error::{Result, ThermiteError};
@@ -19,6 +20,56 @@ use crate::error::{Result, ThermiteError};
 /// Set once at startup via [`set_verbosity`]; read anywhere via
 /// [`verbosity`] or the convenience helper [`is_verbose`].
 static VERBOSITY: OnceLock<u8> = OnceLock::new();
+
+/// Global output sink for the TUI.
+///
+/// When set, every line that would normally be printed to stdout/stderr
+/// (external command output, `verbose` command echoes, `ui` helpers, etc.)
+/// is sent to this channel instead.  The TUI event loop consumes the channel
+/// and renders the lines in its log pane, so the alternate screen is never
+/// corrupted by stray writes.
+///
+/// Set via [`set_output_sink`] before entering the TUI and cleared via
+/// [`clear_output_sink`] on exit.  When unset, all output goes to the real
+/// terminal as before.
+static OUTPUT_SINK: Mutex<Option<UnboundedSender<String>>> = Mutex::new(None);
+
+/// Route all process output into the given channel.
+pub fn set_output_sink(tx: UnboundedSender<String>) {
+    *OUTPUT_SINK.lock().expect("OUTPUT_SINK mutex poisoned") = Some(tx);
+}
+
+/// Remove the output sink, restoring direct terminal output.
+pub fn clear_output_sink() {
+    *OUTPUT_SINK.lock().expect("OUTPUT_SINK mutex poisoned") = None;
+}
+
+/// Whether a TUI output sink is currently active.
+pub fn is_sink_active() -> bool {
+    OUTPUT_SINK
+        .lock()
+        .expect("OUTPUT_SINK mutex poisoned")
+        .is_some()
+}
+
+/// Emit one line of process output.
+///
+/// Lines go to the output sink when a TUI is running, otherwise straight to
+/// stdout.  All user-facing printing in code that may run under the TUI must
+/// go through this helper (or a `ui::print_*` helper, which uses it) rather
+/// than calling `println!` directly, so that the TUI's alternate screen is
+/// never corrupted.
+pub fn out_line(line: &str) {
+    if let Some(tx) = OUTPUT_SINK
+        .lock()
+        .expect("OUTPUT_SINK mutex poisoned")
+        .as_ref()
+    {
+        let _ = tx.send(line.to_owned());
+    } else {
+        println!("{line}");
+    }
+}
 
 /// Set the process-wide verbosity level.
 ///
@@ -60,7 +111,7 @@ pub async fn run_command(
     let display_cmd = format!("{} {}", program, args.join(" "));
     debug!("running: {display_cmd}");
     if is_verbose() {
-        println!("+ {display_cmd}");
+        out_line(&format!("+ {display_cmd}"));
     }
 
     // Check the program exists before spawning so we surface a clear error
@@ -115,7 +166,7 @@ pub async fn run_command(
             line = stdout_reader.next_line() => {
                 match line.map_err(ThermiteError::Io)? {
                     Some(l) => {
-                        println!("{l}");
+                        out_line(&l);
                         stdout_buf.push_str(&l);
                         stdout_buf.push('\n');
                     }
@@ -125,7 +176,7 @@ pub async fn run_command(
             line = stderr_reader.next_line() => {
                 match line.map_err(ThermiteError::Io)? {
                     Some(l) => {
-                        eprintln!("{l}");
+                        out_line(&l);
                         stderr_buf.push_str(&l);
                         stderr_buf.push('\n');
                     }
@@ -137,12 +188,12 @@ pub async fn run_command(
 
     // Drain any remaining lines after the select loop exits.
     while let Some(l) = stdout_reader.next_line().await.map_err(ThermiteError::Io)? {
-        println!("{l}");
+        out_line(&l);
         stdout_buf.push_str(&l);
         stdout_buf.push('\n');
     }
     while let Some(l) = stderr_reader.next_line().await.map_err(ThermiteError::Io)? {
-        eprintln!("{l}");
+        out_line(&l);
         stderr_buf.push_str(&l);
         stderr_buf.push('\n');
     }
@@ -251,5 +302,24 @@ mod tests {
         // Verify the symbol is reachable at compile time.
         // Runtime behaviour (TTY inheritance) is verified via integration tests.
         let _ = run_interactive_command as fn(_, _, _, _) -> _;
+    }
+
+    /// The TUI output sink routes `out_line` output into the channel and
+    /// `is_sink_active` reflects the state.  The sink is global state, so the
+    /// test must always clear it before returning.
+    #[test]
+    fn output_sink_routes_lines_and_clears() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        set_output_sink(tx);
+        assert!(is_sink_active());
+
+        out_line("hello tui");
+        assert_eq!(
+            rx.try_recv().expect("line should be in the sink"),
+            "hello tui"
+        );
+
+        clear_output_sink();
+        assert!(!is_sink_active());
     }
 }

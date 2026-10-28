@@ -22,6 +22,7 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::error::{Result, ThermiteError};
+use crate::types::ubuntu::UbuntuRelease;
 use crate::types::versions::RustVersion;
 
 /// A fully parsed Ubuntu `rustc` package version string.
@@ -284,6 +285,115 @@ impl fmt::Display for RustcPackageVersion {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bump operations
+// ---------------------------------------------------------------------------
+
+/// The bump operation to perform on a [`RustcPackageVersion`].
+///
+/// Shared by the `thermite version bump` CLI subcommand and the TUI
+/// version-bump action. The operations that need a series accept either a
+/// numeric series (`"24.04"`) or an Ubuntu release adjective (`"noble"`).
+#[derive(Debug, Clone)]
+pub enum BumpOperation {
+    /// New upstream patch release — resets all fields.
+    PatchRelease { upstream: String },
+    /// Increment the Ubuntu revision.
+    UbuntuRevision,
+    /// Increment the repack number (resets Ubuntu revision).
+    Repack,
+    /// Generate a backport version (sets series, backport_revision=1).
+    Backport {
+        series: Option<String>,
+        release: Option<String>,
+    },
+    /// Increment the backport revision.
+    BackportRevision,
+    /// Increment the backport repack (resets backport revision).
+    BackportRepack,
+    /// Retarget a backport to a different series.
+    Retarget {
+        series: Option<String>,
+        release: Option<String>,
+    },
+    /// Increment the PPA number (for PPA upload iteration).
+    Ppa,
+    /// Remove the PPA suffix (for final archive upload).
+    ClearPpa,
+}
+
+/// Resolve a series from either a direct series number (`"24.04"`) or an
+/// Ubuntu release adjective (`"noble"`). The two inputs are mutually
+/// exclusive.
+pub fn resolve_series(series: Option<&str>, release: Option<&str>) -> Result<Option<String>> {
+    match (series, release) {
+        (Some(_), Some(_)) => Err(ThermiteError::InvalidRustVersion(
+            "--series and --release are mutually exclusive".to_owned(),
+        )),
+        (Some(s), None) => Ok(Some(s.to_owned())),
+        (None, Some(r)) => {
+            let ubuntu_release = UbuntuRelease::parse(r)?;
+            Ok(Some(ubuntu_release.series_number().to_owned()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Apply `operation` to `v` in place.
+///
+/// # Errors
+///
+/// Returns `ThermiteError::InvalidRustVersion` when an operation requires a
+/// series but neither `--series` nor `--release` was supplied, or when the
+/// upstream version in a patch-release operation is not a valid
+/// `X.Y.Z` version.
+pub fn apply_bump_operation(v: &mut RustcPackageVersion, operation: &BumpOperation) -> Result<()> {
+    match operation {
+        BumpOperation::PatchRelease { upstream } => {
+            let new_upstream = RustVersion::parse(upstream)?;
+            v.bump_patch_release(new_upstream);
+        }
+        BumpOperation::UbuntuRevision => {
+            v.bump_ubuntu_revision();
+        }
+        BumpOperation::Repack => {
+            v.bump_repack();
+        }
+        BumpOperation::Backport { series, release } => {
+            let resolved =
+                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
+                    ThermiteError::InvalidRustVersion(
+                        "backport operation requires --series or --release".to_owned(),
+                    )
+                })?;
+            v.to_backport(&resolved);
+        }
+        BumpOperation::BackportRevision => {
+            v.bump_backport_revision();
+        }
+        BumpOperation::BackportRepack => {
+            v.bump_backport_repack();
+        }
+        BumpOperation::Retarget { series, release } => {
+            let resolved =
+                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
+                    ThermiteError::InvalidRustVersion(
+                        "retarget operation requires --series or --release".to_owned(),
+                    )
+                })?;
+            v.retarget_series(&resolved);
+        }
+        BumpOperation::Ppa => {
+            v.bump_ppa();
+        }
+        BumpOperation::ClearPpa => {
+            v.clear_ppa();
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
