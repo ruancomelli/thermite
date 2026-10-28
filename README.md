@@ -103,6 +103,7 @@ Commands:
   update    Package a new upstream Rust toolchain release for Ubuntu
   backport  Backport an existing Rust toolchain package to an older Ubuntu release
   version   Parse, explain, format, or bump Ubuntu rustc package version strings
+  tarball   Download or regenerate the orig and orig-vendor source tarballs
   help      Print this message or the help of the given subcommand(s)
 ```
 
@@ -173,7 +174,7 @@ Adapts an existing versioned `rustc-X.Y` package for an older Ubuntu release.
 ```
 thermite backport [OPTIONS]
   -u, --rust-version      <X.Y.Z>   Rust version to backport        (e.g. 1.85.0)
-  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble)
+  -s, --source-release    <NAME>    Ubuntu release to port FROM      (e.g. noble, or 'devel')
   -r, --release           <NAME>    Ubuntu release to port TO        (e.g. jammy)
   -l, --lpuser            <NAME>    Launchpad username
   -b, --lp-bug-number     <NUMBER>  Launchpad bug ID (optional; omit for proactive backports)
@@ -297,6 +298,88 @@ thermite version bump "1.95.0+dfsg-0ubuntu1" ppa
 thermite version bump --from-changelog ubuntu-revision
 ```
 
+### `thermite tarball`
+
+Standalone management of the two source tarballs outside the full update/backport
+workflows. Each tarball can either be **downloaded** (staging PPA first, then the
+Ubuntu primary archive via `rmadison`, with a manual-placement fallback) or
+**generated** (`uscan` for the orig tarball; `rustup` + `cargo-vendor-filterer` +
+`debian/rules vendor-tarball` for the vendor tarball). An already-obtained
+tarball can also be **overlaid** into the repo directory.
+
+```
+thermite tarball download orig|vendor|all [OPTIONS]
+thermite tarball generate orig|vendor|all [OPTIONS]
+thermite tarball overlay   orig|vendor|all [OPTIONS]
+
+  -u, --rust-version   <X.Y.Z>  Full Rust version the tarballs are named after
+  --series             <NAME>   Ubuntu release adjective for backport-style names
+                                (e.g. noble → '+dfsg~26.04'). Omit for plain
+                                update naming ('+dfsg')
+  -d, --repo-dir       <PATH>   Debian source package root
+                                [default: current directory]
+
+generate only:
+  --force                       Overwrite a tarball that already exists in the
+                                parent directory (without it, generate refuses)
+
+vendor and all only (overlay):
+  --replace                     Remove the existing vendor/ directory before
+                                extracting (clean replace instead of merge)
+```
+
+Downloads are idempotent: an existing tarball is reused. Generation overwrites
+only with `--force`. The vendor tarball generation requires `rustup` and produces
+`../rustc-<X.Y>_<X.Y.Z>+dfsg[~<series>].orig-vendor.tar.xz`. Neither download
+nor generate touches the working tree — run `thermite tarball overlay`
+afterwards to extract a tarball into the repo dir.
+
+Overlay never fetches or produces tarballs: the expected tarball must already
+exist in the parent directory (use download/generate first), otherwise the
+command refuses. Overlaying the orig tarball extracts its full contents into
+the repo dir with the top-level `rustc-<X.Y.Z>-src/` directory stripped;
+overlaying the vendor tarball merges `vendor/` into the repo dir, or cleanly
+replaces it with `--replace`. With `all`, the orig tarball is overlaid first
+and `--replace` applies to the vendor part only.
+
+#### Example: regenerate the orig tarball for a backport
+
+```sh
+cd ~/rustc/rustc
+thermite tarball generate orig \
+  --rust-version 1.85.0 \
+  --series       noble
+# produces ../rustc-1.85_1.85.0+dfsg~26.04.orig.tar.xz
+```
+
+#### Example: regenerate the vendor tarball and overlay it (clean replace)
+
+```sh
+thermite tarball generate vendor \
+  --rust-version 1.85.0 \
+  --series       noble \
+  --force
+thermite tarball overlay vendor \
+  --rust-version 1.85.0 \
+  --series       noble \
+  --replace
+```
+
+#### Example: download both tarballs for a plain update naming scheme
+
+```sh
+thermite tarball download all --rust-version 1.85.1
+```
+
+#### Example: restore the working tree from existing tarballs after a git clean
+
+```sh
+cd ~/rustc/rustc
+thermite tarball overlay all \
+  --rust-version 1.85.0 \
+  --series       noble
+```
+
 ---
 
 ## Workflow Phases (update command)
@@ -343,20 +426,20 @@ start of each phase.
 |-------|-------------|------|
 | 0 | Preflight checks — verify required tools and repository layout | Automated |
 | 1 | Create a Launchpad bug report (optional for proactive backports) | Interactive |
-| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`) | Automated |
+| 2 | Set up Git branch (`<release>-X.Y` from `<source_release>-X.Y`, or `merge-X.Y` when the source is the devel release) | Automated |
 | 3 | Compute and apply backport version string; update `debian/changelog` | Automated |
-| 4 | Generate orig tarball with `uscan`; rename to include `~<series>` suffix | Automated |
-| 5 | Generate orig-vendor tarball with `debian/rules vendor-tarball` | Automated |
-| 6 | Compatibility Checks — check and apply changes for LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat | Interactive |
+| 4 | Compatibility checks — LLVM, libgit2, dh-cargo, pkgconf, cmake, debhelper-compat against the target release | Interactive |
+| 5 | Provide orig tarball — reuse locally, download automatically from the staging PPA / Ubuntu archive, or regenerate with `uscan` | Interactive |
+| 6 | Provide orig-vendor tarball — reuse, download, or regenerate with `debian/rules vendor-tarball` | Interactive |
 | 7 | Disable autopkgtest self-build test in `debian/tests/control` | Automated |
 | 8 | Local build and bug fixing with `sbuild` (skippable) | Interactive |
-| 9 | Build source package with `dpkg-buildpackage -S` (skippable if `.dsc` exists) | Automated |
+| 9 | Build source package with `dpkg-buildpackage -S` (skippable if `.dsc` exists) | Interactive |
 | 10 | Lintian checks on the source package (skippable) | Interactive |
 | 11 | PPA build — upload to personal Launchpad PPA and verify all architectures | Interactive |
 | 12 | Staging PPA upload — update changelog and upload to `ppa:rust-toolchain/staging` | Interactive |
-| 13 | Run `autopkgtest`s via the staging PPA | Interactive |
-| 14 | Push branch to the Foundations repository | Automated |
-| 15 | Archive upload request (optional — priority backports only) | Interactive |
+| 13 | Autopkgtests — trigger and verify via `ppa tests` on the staging PPA | Interactive |
+| 14 | Push branch to the Foundations rustc repository | Interactive |
+| 15 | Archive upload (optional) — request via the Ubuntu Security team | Interactive |
 
 ---
 
@@ -378,6 +461,7 @@ src/
     gbp.rs              gbp import-orig
     git.rs              Git operations
     lintian.rs          lintian invocations
+    overlay.rs          Extracting tarball contents into the working tree
     patches.rs          quilt push/refresh
     ppa.rs              ppa-dev-tools, dput, and staging PPA helpers
     uscan.rs            uscan and orig tarball management

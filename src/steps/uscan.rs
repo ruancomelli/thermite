@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::{Result, ThermiteError};
 use crate::shell::run_command;
+use crate::steps::tarball_fetch::{TarballKind, expected_tarball_name};
 use crate::types::versions::RustVersion;
 
 /// Delays (in seconds) between successive uscan retry attempts when a
@@ -61,15 +63,116 @@ fn is_rate_limit_error(stdout: &str, stderr: &str) -> bool {
     })
 }
 
+/// Create a private staging directory for one uscan run:
+/// `<parent>/.thermite/uscan-<version>-<pid>-<nanos>` inside the repo's
+/// parent directory. It lives on the same filesystem as the final tarball
+/// destination, so the produced file can simply be renamed into place.
+fn new_staging_dir(repo_dir: &Path, version: &RustVersion) -> Result<PathBuf> {
+    let parent_dir = repo_dir.parent().unwrap_or(repo_dir);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = parent_dir.join(format!(
+        ".thermite/uscan-{version}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Remove the staging directory, and its `.thermite` parent when that became
+/// empty. Best-effort: a leftover directory is harmless clutter.
+fn remove_staging_dir(staging: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(staging) {
+        warn!(
+            "failed to remove uscan staging dir {}: {e}",
+            staging.display()
+        );
+    }
+    if let Some(thermite_dir) = staging.parent() {
+        let _ = std::fs::remove_dir(thermite_dir);
+    }
+}
+
+/// Find the orig tarball uscan produced in `staging`.
+///
+/// Matches files ending in `.orig.tar.xz`; uscan's intermediate downloads
+/// (e.g. `rustc-<version>-src.tar.xz`) do not match. When several candidates
+/// exist, the most recently modified one wins.
+fn find_produced_tarball(staging: &Path) -> Result<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().ends_with(".orig.tar.xz") {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .ok_or_else(|| ThermiteError::CommandFailed {
+            cmd: "uscan".to_owned(),
+            code: 0,
+            stdout: String::new(),
+            stderr: format!(
+                "uscan reported success but no orig tarball (*.orig.tar.xz) was found in {}",
+                staging.display()
+            ),
+        })
+}
+
 /// Run `uscan --download-version <version>` from `repo_dir`, streaming output
 /// to the terminal and saving it to `log_path`.
+///
+/// uscan downloads into a private staging directory (`.thermite/uscan-…`
+/// inside the repo's parent directory) instead of the shared parent, so the
+/// produced tarball can be identified unambiguously even when several
+/// backports share the same worktree. On success the tarball is moved into
+/// the repo's parent directory under its final name,
+/// `rustc-<short>_<version>+dfsg<dfsg_suffix>.orig.tar.xz`, and the staging
+/// directory is removed. `dfsg_suffix` is appended after `+dfsg` as given:
+/// `""` for canonical naming, `"~old"` for the update workflow, or
+/// `"~<series>"` for backport naming. The dfsg suffix uscan itself produces
+/// follows the watch file's `repacksuffix` (`+dfsg` for rustc-1.97 and
+/// newer, `+dfsg1` for older packages) and is normalised away by the move.
 ///
 /// If uscan exits with a 403 rate-limit error the step is retried up to three
 /// times, pausing for 15 s, 30 s, and 60 s respectively between attempts.
 ///
-/// Returns the path to the generated orig tarball in the parent directory.
-pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) -> Result<PathBuf> {
+/// Returns the path to the orig tarball under its final name.
+pub async fn run_uscan(
+    repo_dir: &Path,
+    version: &RustVersion,
+    dfsg_suffix: &str,
+    log_path: &Path,
+) -> Result<PathBuf> {
+    let staging = new_staging_dir(repo_dir, version)?;
+    info!("staging uscan download in {}", staging.display());
+    let result = run_uscan_staged(repo_dir, version, dfsg_suffix, log_path, &staging).await;
+    remove_staging_dir(&staging);
+    result
+}
+
+/// Run the uscan retry loop with `staging` as the download directory.
+async fn run_uscan_staged(
+    repo_dir: &Path,
+    version: &RustVersion,
+    dfsg_suffix: &str,
+    log_path: &Path,
+    staging: &Path,
+) -> Result<PathBuf> {
     let version_str = version.to_string();
+    let staging_str = staging.to_string_lossy().to_string();
+    let final_name =
+        expected_tarball_name(&version.short(), version, dfsg_suffix, TarballKind::Orig);
+    let parent_dir = repo_dir.parent().unwrap_or(repo_dir);
+    let final_path = parent_dir.join(final_name);
+
     // attempt 0 = first try, attempts 1-3 = retries after rate-limit.
     let mut last_rate_limit_err: Option<ThermiteError> = None;
 
@@ -82,21 +185,30 @@ pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) 
 
         match run_command(
             "uscan",
-            &["--download-version", &version_str, "-v"],
+            &[
+                "--download-version",
+                &version_str,
+                "-v",
+                "--destdir",
+                &staging_str,
+            ],
             repo_dir,
             &[],
         )
         .await
         {
             Ok(output) => {
-                let short = version.short();
-                let tarball_name = format!("rustc-{short}_{version}+dfsg1.orig.tar.xz");
-                let tarball = repo_dir.parent().unwrap_or(repo_dir).join(&tarball_name);
-
                 let log_content = output.stdout + &output.stderr;
                 std::fs::write(log_path, &log_content)?;
 
-                return Ok(tarball);
+                let produced = find_produced_tarball(staging)?;
+                std::fs::rename(&produced, &final_path)?;
+                println!(
+                    "  uscan produced {} — moved to {}",
+                    produced.display(),
+                    final_path.display()
+                );
+                return Ok(final_path);
             }
             Err(e) => {
                 let rate_limited = if let ThermiteError::CommandFailed {
@@ -114,6 +226,9 @@ pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) 
                     last_rate_limit_err = Some(e);
                     // continue to next attempt
                 } else {
+                    if let ThermiteError::CommandFailed { stdout, stderr, .. } = &e {
+                        let _ = std::fs::write(log_path, format!("{stdout}{stderr}"));
+                    }
                     return Err(e);
                 }
             }
@@ -123,52 +238,6 @@ pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) 
     // All three retries exhausted — surface the last rate-limit error.
     Err(last_rate_limit_err
         .expect("loop invariant: last_rate_limit_err is set before reaching this point"))
-}
-
-/// Rename a tarball by replacing its current stem suffix with `new_suffix`.
-///
-/// For example, calling `rename_tarball_with_suffix(path, "~old")` on a path
-/// ending in `1.orig.tar.xz` produces a path ending in `~old.orig.tar.xz`.
-pub fn rename_tarball_with_suffix(tarball: &Path, new_suffix: &str) -> Result<PathBuf> {
-    let name = tarball
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-
-    // Strip the `1` suffix that uscan appends before `.orig.tar.xz`.
-    let new_name = if let Some(base) = name.strip_suffix("1.orig.tar.xz") {
-        format!("{base}{new_suffix}.orig.tar.xz")
-    } else if let Some(base) = name.strip_suffix(".orig.tar.xz") {
-        format!("{base}{new_suffix}.orig.tar.xz")
-    } else {
-        format!("{name}{new_suffix}")
-    };
-
-    let new_path = tarball.with_file_name(new_name);
-    std::fs::rename(tarball, &new_path)?;
-    Ok(new_path)
-}
-
-/// Rename a tarball to the canonical orig tarball format (no extra suffix).
-///
-/// Strips the numeric suffix `1` added by uscan, producing the final name.
-pub fn rename_tarball_to_canonical(tarball: &Path) -> Result<PathBuf> {
-    let name = tarball
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-
-    let new_name = if let Some(base) = name.strip_suffix("1.orig.tar.xz") {
-        format!("{base}.orig.tar.xz")
-    } else {
-        name.to_owned()
-    };
-
-    let new_path = tarball.with_file_name(new_name);
-    if tarball != new_path {
-        std::fs::rename(tarball, &new_path)?;
-    }
-    Ok(new_path)
 }
 
 /// List all `.c` source files inside a `.tar.xz` archive without extracting it.
@@ -195,23 +264,88 @@ pub async fn list_c_files_in_tarball(tarball: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::FileTimes;
+    use std::time::Duration;
 
-    /// Finding 7: rename_tarball_with_suffix correctly appends the suffix
-    /// before .orig.tar.xz.
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "thermite-uscan-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Set a file's mtime `offset_secs` in the past so mtime-based selection
+    /// is deterministic regardless of directory iteration order.
+    fn set_mtime(path: &Path, offset_secs: u64) {
+        let modified = SystemTime::now() - Duration::from_secs(offset_secs);
+        let file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
     #[test]
-    fn rename_tarball_with_suffix_produces_correct_name() {
-        // Use a temp path; we test name construction without touching the fs.
-        let path = std::path::PathBuf::from("/tmp/rustc-1.85_1.85.0+dfsg1.orig.tar.xz");
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let new_name = if let Some(base) = name.strip_suffix("1.orig.tar.xz") {
-            format!("{base}~old.orig.tar.xz")
-        } else {
-            name.to_owned()
-        };
-        assert_eq!(new_name, "rustc-1.85_1.85.0+dfsg~old.orig.tar.xz");
+    fn find_produced_tarball_ignores_intermediates() {
+        let tmp = temp_dir("find-orig");
+        fs::write(tmp.join("rustc-1.97.1-src.tar.xz"), b"intermediate").unwrap();
+        fs::write(tmp.join("uscan.log"), b"log").unwrap();
+        let orig = tmp.join("rustc-1.97_1.97.1+dfsg.orig.tar.xz");
+        fs::write(&orig, b"orig").unwrap();
+
+        assert_eq!(find_produced_tarball(&tmp).unwrap(), orig);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_produced_tarball_prefers_newest() {
+        let tmp = temp_dir("find-newest");
+        let older = tmp.join("rustc-1.96_1.96.0+dfsg1.orig.tar.xz");
+        let newer = tmp.join("rustc-1.97_1.97.1+dfsg.orig.tar.xz");
+        fs::write(&older, b"older").unwrap();
+        fs::write(&newer, b"newer").unwrap();
+        set_mtime(&older, 60);
+        set_mtime(&newer, 0);
+
+        assert_eq!(find_produced_tarball(&tmp).unwrap(), newer);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_produced_tarball_errors_when_missing() {
+        let tmp = temp_dir("find-missing");
+        fs::write(tmp.join("rustc-1.97.1-src.tar.xz"), b"intermediate").unwrap();
+
+        assert!(find_produced_tarball(&tmp).is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn staging_dir_is_created_unique_and_removable() {
+        let tmp = temp_dir("staging");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let a = new_staging_dir(&repo, &RustVersion::parse("1.97.1").unwrap()).unwrap();
+        let b = new_staging_dir(&repo, &RustVersion::parse("1.97.1").unwrap()).unwrap();
+        assert_ne!(a, b);
+        assert!(a.exists());
+        assert!(b.exists());
+
+        remove_staging_dir(&a);
+        assert!(!a.exists());
+        assert!(b.exists(), ".thermite kept while other staging dirs remain");
+
+        remove_staging_dir(&b);
+        assert!(!b.exists());
+        assert!(!tmp.join(".thermite").exists(), "empty .thermite removed");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// Finding 7: log_path receives the uscan output rather than being left

@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use thermite::commands::{backport, update, version};
-use thermite::error::Result;
+use thermite::commands::tarball::TarballTarget;
+use thermite::commands::{backport, tarball, update, version};
+use thermite::error::{Result, ThermiteError};
 use thermite::shell;
-use thermite::types::params::{BackportParams, UpdateParams};
+use thermite::types::params::{BackportParams, TarballAction, TarballParams, UpdateParams};
 
 /// thermite — Ubuntu Rust toolchain packaging tool.
 #[derive(Debug, Parser)]
@@ -64,7 +65,8 @@ enum Commands {
         #[arg(short = 'u', long)]
         rust_version: String,
 
-        /// Ubuntu release to backport FROM (e.g. noble).
+        /// Ubuntu release to backport FROM (e.g. noble, or 'devel' for the
+        /// current Ubuntu development release).
         #[arg(short = 's', long)]
         source_release: String,
 
@@ -102,6 +104,12 @@ enum Commands {
     Version {
         #[command(subcommand)]
         subcommand: VersionCommands,
+    },
+
+    /// Download or regenerate the orig and orig-vendor source tarballs.
+    Tarball {
+        #[command(subcommand)]
+        action: TarballCommands,
     },
 }
 
@@ -304,6 +312,101 @@ enum BumpOperationCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum TarballCommands {
+    /// Download the tarball(s) from the staging PPA or the Ubuntu archive.
+    Download {
+        #[command(subcommand)]
+        target: DownloadTarget,
+    },
+    /// Generate the tarball(s) locally (uscan or debian/rules vendor-tarball).
+    Generate {
+        #[command(subcommand)]
+        target: GenerateTarget,
+    },
+    /// Extract an already-obtained tarball's contents into the repo directory.
+    Overlay {
+        #[command(subcommand)]
+        target: OverlayTarget,
+    },
+}
+
+/// Arguments shared by every `tarball` leaf.
+#[derive(Debug, Args)]
+struct TarballCommonArgs {
+    /// Full Rust version in X.Y.Z format (e.g. 1.85.0).
+    #[arg(short = 'u', long)]
+    rust_version: String,
+
+    /// Ubuntu release adjective used for backport-style tarball names
+    /// (e.g. noble → '+dfsg~26.04'). Omit for plain update naming ('+dfsg').
+    #[arg(long)]
+    series: Option<String>,
+
+    /// Path to the root of the Debian source package (defaults to the
+    /// current working directory).
+    #[arg(short = 'd', long)]
+    repo_dir: Option<PathBuf>,
+}
+
+/// Download leaves (no `--force`: download reuses what exists, and the
+/// working tree is never touched — use `tarball overlay` for that).
+#[derive(Debug, Subcommand)]
+enum DownloadTarget {
+    /// The orig tarball (filtered upstream Rust source).
+    Orig(TarballCommonArgs),
+    /// The orig-vendor tarball (vendored crate dependencies).
+    Vendor(TarballCommonArgs),
+    /// Both tarballs, orig first.
+    All(TarballCommonArgs),
+}
+
+/// Generate leaves (with `--force` to overwrite an existing tarball).
+#[derive(Debug, Subcommand)]
+enum GenerateTarget {
+    /// The orig tarball (filtered upstream Rust source).
+    Orig(TarballGenerateArgs),
+    /// The orig-vendor tarball (vendored crate dependencies).
+    Vendor(TarballGenerateArgs),
+    /// Both tarballs, orig first.
+    All(TarballGenerateArgs),
+}
+
+#[derive(Debug, Args)]
+struct TarballGenerateArgs {
+    #[command(flatten)]
+    common: TarballCommonArgs,
+
+    /// Overwrite the tarball if it already exists in the parent directory.
+    #[arg(long)]
+    force: bool,
+}
+
+/// Overlay leaves: extract a tarball that already exists in the parent
+/// directory into the repo dir. No `--force`: overlay never creates tarballs.
+#[derive(Debug, Subcommand)]
+enum OverlayTarget {
+    /// The orig tarball (filtered upstream Rust source), extracted with its
+    /// top-level source directory stripped.
+    Orig(TarballCommonArgs),
+    /// The orig-vendor tarball (vendored crate dependencies).
+    Vendor(TarballOverlayVendorArgs),
+    /// Both tarballs, orig first.
+    All(TarballOverlayVendorArgs),
+}
+
+#[derive(Debug, Args)]
+struct TarballOverlayVendorArgs {
+    #[command(flatten)]
+    common: TarballCommonArgs,
+
+    /// Remove the existing vendor/ directory before extracting the vendor
+    /// tarball (clean replace) instead of merging over it. Applies to the
+    /// vendor tarball only.
+    #[arg(long)]
+    replace: bool,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -316,6 +419,50 @@ async fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the repo directory to an absolute canonical path.
+fn resolve_repo_dir(repo_dir: Option<PathBuf>) -> Result<PathBuf> {
+    // Canonicalize so that `repo_dir.parent().unwrap_or(repo_dir)` in
+    // downstream steps resolves to the real parent directory even when a
+    // relative path with no parent component (e.g. `.`) is passed:
+    // `Path::new(".").parent()` returns `Some("")`, which would otherwise
+    // resolve to the process cwd (the source tree itself) and cause
+    // logs/tarballs to be written there.
+    match repo_dir {
+        Some(p) => std::fs::canonicalize(&p).map_err(ThermiteError::Io),
+        None => std::env::current_dir().map_err(ThermiteError::Io),
+    }
+}
+
+fn tarball_download_params(common: &TarballCommonArgs) -> Result<TarballParams> {
+    TarballParams::new(
+        TarballAction::Download,
+        &common.rust_version,
+        common.series.as_deref(),
+        false,
+        false,
+    )
+}
+
+fn tarball_generate_params(common: &TarballCommonArgs, force: bool) -> Result<TarballParams> {
+    TarballParams::new(
+        TarballAction::Generate,
+        &common.rust_version,
+        common.series.as_deref(),
+        force,
+        false,
+    )
+}
+
+fn tarball_overlay_params(common: &TarballCommonArgs, replace: bool) -> Result<TarballParams> {
+    TarballParams::new(
+        TarballAction::Overlay,
+        &common.rust_version,
+        common.series.as_deref(),
+        false,
+        replace,
+    )
 }
 
 async fn run() -> Result<()> {
@@ -342,11 +489,7 @@ async fn run() -> Result<()> {
                 &lp_bug_number,
             )?;
 
-            // Finding 11: replace expect() with structured error propagation.
-            let repo_path = match repo_dir {
-                Some(p) => p,
-                None => std::env::current_dir().map_err(thermite::error::ThermiteError::Io)?,
-            };
+            let repo_path = resolve_repo_dir(repo_dir)?;
 
             update::run(&params, &repo_path).await?;
         }
@@ -371,16 +514,54 @@ async fn run() -> Result<()> {
                 dry_run,
             )?;
 
-            let repo_path = match repo_dir {
-                Some(p) => p,
-                None => std::env::current_dir().map_err(thermite::error::ThermiteError::Io)?,
-            };
+            let repo_path = resolve_repo_dir(repo_dir)?;
 
             backport::run(&params, &repo_path).await?;
         }
 
         Commands::Version { subcommand } => {
             dispatch_version(subcommand)?;
+        }
+
+        Commands::Tarball { action } => {
+            let (params, repo_dir, target) = match action {
+                TarballCommands::Download { target } => {
+                    let (common, target) = match target {
+                        DownloadTarget::Orig(args) => (args, TarballTarget::Orig),
+                        DownloadTarget::Vendor(args) => (args, TarballTarget::Vendor),
+                        DownloadTarget::All(args) => (args, TarballTarget::All),
+                    };
+                    (tarball_download_params(&common)?, common.repo_dir, target)
+                }
+                TarballCommands::Generate { target } => {
+                    let (common, force, target) = match target {
+                        GenerateTarget::Orig(args) => {
+                            (args.common, args.force, TarballTarget::Orig)
+                        }
+                        GenerateTarget::Vendor(args) => {
+                            (args.common, args.force, TarballTarget::Vendor)
+                        }
+                        GenerateTarget::All(args) => (args.common, args.force, TarballTarget::All),
+                    };
+                    let params = tarball_generate_params(&common, force)?;
+                    (params, common.repo_dir, target)
+                }
+                TarballCommands::Overlay { target } => {
+                    let (common, replace, target) = match target {
+                        OverlayTarget::Orig(args) => (args, false, TarballTarget::Orig),
+                        OverlayTarget::Vendor(args) => {
+                            (args.common, args.replace, TarballTarget::Vendor)
+                        }
+                        OverlayTarget::All(args) => (args.common, args.replace, TarballTarget::All),
+                    };
+                    let params = tarball_overlay_params(&common, replace)?;
+                    (params, common.repo_dir, target)
+                }
+            };
+
+            let repo_path = resolve_repo_dir(repo_dir)?;
+
+            tarball::run(&params, &repo_path, target).await?;
         }
     }
 

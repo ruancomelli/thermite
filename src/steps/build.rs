@@ -165,56 +165,141 @@ pub async fn quilt_pop_all(repo_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the autopkgtest self-build test block from `debian/tests/control`.
+/// Outcome of attempting to remove the self-build test stanza from
+/// `debian/tests/control`.
 ///
-/// The block to remove is exactly:
-/// ```text
-/// Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
-/// Depends: @, @builddeps@
-/// Restrictions: rw-build-tree, allow-stderr
-/// ```
+/// The removal is driven by [`disable_self_build_test`], which recognises the
+/// stanza shapes that upstream Debian has used so far. The caller is expected
+/// to handle [`SelfBuildTestOutcome::NeedsManualIntervention`] by prompting
+/// the user — see the Phase 7 call site in `commands/backport.rs`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SelfBuildTestOutcome {
+    /// The self-build stanza was recognised and removed; the file was rewritten.
+    Removed,
+    /// The self-build marker was not present in the file (already absent).
+    AlreadyAbsent,
+    /// The marker line was found, but the surrounding stanza does not match
+    /// any known shape. The file was left untouched; the caller should ask
+    /// the user to remove the stanza manually (or skip the removal).
+    NeedsManualIntervention,
+}
+
+/// The line that begins the self-build test stanza.
 ///
-/// If the block is not present (e.g. already removed), the function succeeds
-/// without modifying the file.
-pub fn disable_self_build_test(repo_dir: &Path) -> Result<()> {
+/// Used as the anchor for locating the stanza within `debian/tests/control`.
+const SELFBUILD_MARKER: &str = "Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1";
+
+/// The canonical 3-line self-build stanza (older Rust packaging).
+const SELFBUILD_STANZA_A: &[&str] = &[
+    "Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1",
+    "Depends: @, @builddeps@",
+    "Restrictions: rw-build-tree, allow-stderr",
+];
+
+/// The 6-line self-build stanza introduced in newer Rust packaging, which
+/// adds two explanatory comments and an `Architecture:` restriction.
+const SELFBUILD_STANZA_B: &[&str] = &[
+    "Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1",
+    "Depends: @, @builddeps@",
+    "Restrictions: rw-build-tree, allow-stderr",
+    "# Other arches work but are flaky due to memory limitations.",
+    "# Additionally, the test doesn't test for anything arch-specific.",
+    "Architecture: amd64",
+];
+
+/// Remove the autopkgtest self-build test stanza from `debian/tests/control`.
+///
+/// Two stanza shapes are recognised (after trimming trailing whitespace from
+/// each line):
+///
+/// - **Pattern A** (3 lines): `Test-Command` + `Depends` + `Restrictions`.
+/// - **Pattern B** (6 lines): Pattern A plus two comment lines and
+///   `Architecture: amd64`.
+///
+/// Any other shape — a stanza with extra fields, altered comments, or missing
+/// lines — is left untouched and reported via
+/// [`SelfBuildTestOutcome::NeedsManualIntervention`] so the caller can prompt
+/// the user. This keeps the removal future-proof: when upstream Debian next
+/// changes the stanza, thermite will refuse to silently mangle the file
+/// instead of leaving it half-edited.
+///
+/// If `debian/tests/control` does not exist or contains no self-build marker,
+/// the function succeeds and returns [`SelfBuildTestOutcome::AlreadyAbsent`].
+pub fn disable_self_build_test(repo_dir: &Path) -> Result<SelfBuildTestOutcome> {
     let tests_control = repo_dir.join("debian/tests/control");
     if !tests_control.exists() {
-        return Ok(());
+        return Ok(SelfBuildTestOutcome::AlreadyAbsent);
     }
 
     let content = std::fs::read_to_string(&tests_control)?;
 
-    // The self-build block starts with this prefix (may have varying spacing).
-    const SELFBUILD_MARKER: &str = "Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1";
-
-    if !content.contains(SELFBUILD_MARKER) {
-        // Already absent — nothing to do.
-        return Ok(());
+    if !content
+        .lines()
+        .any(|l| l.trim_start().starts_with(SELFBUILD_MARKER))
+    {
+        return Ok(SelfBuildTestOutcome::AlreadyAbsent);
     }
 
-    // Remove the three-line block.  We iterate over lines and skip the
-    // SELFBUILD_MARKER line plus the two lines immediately following it
-    // (Depends and Restrictions).
-    let mut out_lines: Vec<&str> = Vec::new();
-    let mut skip_remaining: u32 = 0;
-    for line in content.lines() {
-        if skip_remaining > 0 {
-            skip_remaining -= 1;
-            continue;
-        }
-        if line
-            .trim_start()
-            .starts_with("Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1")
-        {
-            // Skip this line and the next two.
-            skip_remaining = 2;
-            continue;
-        }
-        out_lines.push(line);
+    let all_lines: Vec<&str> = content.lines().collect();
+
+    // Locate the self-build stanza: its first line is the marker, and it must
+    // start a stanza — i.e. it is either at the top of the file or preceded by
+    // a blank line. This prevents matching the marker when it appears in the
+    // middle of some other stanza.
+    let Some(start) = all_lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(SELFBUILD_MARKER))
+    else {
+        return Ok(SelfBuildTestOutcome::AlreadyAbsent);
+    };
+    let starts_new_stanza = start == 0 || all_lines[start - 1].trim().is_empty();
+    if !starts_new_stanza {
+        return Ok(SelfBuildTestOutcome::NeedsManualIntervention);
     }
 
-    // Remove any leading blank lines that were left at the top of the file
-    // after the block was removed.
+    // The stanza runs from `start` until the next blank line or EOF.
+    let end = all_lines[start..]
+        .iter()
+        .position(|l| l.trim().is_empty())
+        .map(|offset| start + offset)
+        .unwrap_or(all_lines.len());
+
+    let stanza_lines: Vec<&str> = all_lines[start..end].to_vec();
+
+    let normalised: Vec<String> = stanza_lines
+        .iter()
+        .map(|l| l.trim_start().trim_end().to_owned())
+        .collect();
+
+    let matches_a = normalised.as_slice() == SELFBUILD_STANZA_A;
+    let matches_b = normalised.as_slice() == SELFBUILD_STANZA_B;
+
+    if !matches_a && !matches_b {
+        return Ok(SelfBuildTestOutcome::NeedsManualIntervention);
+    }
+
+    // Remove the stanza plus one adjacent blank line so we don't leave a
+    // double-blank gap. Prefer the trailing blank line; fall back to the
+    // leading one.
+    let remove_start = if end < all_lines.len() && all_lines[end].trim().is_empty() {
+        start
+    } else if start > 0 && all_lines[start - 1].trim().is_empty() {
+        start - 1
+    } else {
+        start
+    };
+    let remove_end = if end < all_lines.len() && all_lines[end].trim().is_empty() {
+        end + 1
+    } else {
+        end
+    };
+
+    let mut out_lines: Vec<&str> =
+        Vec::with_capacity(all_lines.len() - (remove_end - remove_start));
+    out_lines.extend_from_slice(&all_lines[..remove_start]);
+    out_lines.extend_from_slice(&all_lines[remove_end..]);
+
+    // Drop any leading blank lines left at the top of the file after removal.
     while out_lines
         .first()
         .map(|l| l.trim().is_empty())
@@ -225,7 +310,7 @@ pub fn disable_self_build_test(repo_dir: &Path) -> Result<()> {
 
     let new_content = out_lines.join("\n") + "\n";
     std::fs::write(&tests_control, new_content)?;
-    Ok(())
+    Ok(SelfBuildTestOutcome::Removed)
 }
 
 #[cfg(test)]
@@ -235,11 +320,12 @@ mod disable_self_build_tests {
 
     fn write_temp_tests_control_manual(content: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "thermite-test-{}",
+            "thermite-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_nanos()
+                .as_nanos()
         ));
         let tests_dir = base.join("debian/tests");
         fs::create_dir_all(&tests_dir).expect("create dirs");
@@ -249,7 +335,7 @@ mod disable_self_build_tests {
     }
 
     #[test]
-    fn removes_self_build_block() {
+    fn removes_self_build_block_pattern_a() {
         let control_content = "\
 Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
 Depends: @, @builddeps@
@@ -260,11 +346,100 @@ Depends: @
 Restrictions: allow-stderr
 ";
         let repo_dir = write_temp_tests_control_manual(control_content);
-        disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::Removed);
         let result =
             fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
         assert!(!result.contains("RUST_TEST_SELFBUILD"));
         assert!(result.contains("cargo test"));
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn removes_self_build_block_pattern_b() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+Depends: @, @builddeps@
+Restrictions: rw-build-tree, allow-stderr
+# Other arches work but are flaky due to memory limitations.
+# Additionally, the test doesn't test for anything arch-specific.
+Architecture: amd64
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::Removed);
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert!(!result.contains("RUST_TEST_SELFBUILD"));
+        assert!(!result.contains("Architecture: amd64"));
+        assert!(result.contains("cargo test"));
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn pattern_b_with_extra_field_needs_manual_intervention() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+Depends: @, @builddeps@
+Restrictions: rw-build-tree, allow-stderr
+# Other arches work but are flaky due to memory limitations.
+# Additionally, the test doesn't test for anything arch-specific.
+Architecture: amd64 arm64
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::NeedsManualIntervention);
+        // File must be left untouched.
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert_eq!(result, control_content);
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn trailing_whitespace_tolerated() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1   
+Depends: @, @builddeps@   
+Restrictions: rw-build-tree, allow-stderr   
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::Removed);
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert!(!result.contains("RUST_TEST_SELFBUILD"));
+        assert!(result.contains("cargo test"));
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn marker_alone_without_depends_needs_manual_intervention() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::NeedsManualIntervention);
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert_eq!(result, control_content);
         let _ = fs::remove_dir_all(&repo_dir);
     }
 
@@ -276,10 +451,48 @@ Depends: @
 Restrictions: allow-stderr
 ";
         let repo_dir = write_temp_tests_control_manual(control_content);
-        disable_self_build_test(&repo_dir).expect("no_op");
+        let outcome = disable_self_build_test(&repo_dir).expect("no_op");
+        assert_eq!(outcome, SelfBuildTestOutcome::AlreadyAbsent);
         let result =
             fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
         assert_eq!(result.trim(), control_content.trim());
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn no_op_when_control_file_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "thermite-test-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let outcome = disable_self_build_test(&base).expect("missing file");
+        assert_eq!(outcome, SelfBuildTestOutcome::AlreadyAbsent);
+    }
+
+    #[test]
+    fn removes_leading_blanks_after_top_of_file_removal() {
+        let control_content = "\
+Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+Depends: @, @builddeps@
+Restrictions: rw-build-tree, allow-stderr
+
+Test-Command: cargo test
+Depends: @
+Restrictions: allow-stderr
+";
+        let repo_dir = write_temp_tests_control_manual(control_content);
+        let outcome = disable_self_build_test(&repo_dir).expect("disable_self_build_test");
+        assert_eq!(outcome, SelfBuildTestOutcome::Removed);
+        let result =
+            fs::read_to_string(repo_dir.join("debian/tests/control")).expect("read result");
+        assert!(
+            !result.starts_with('\n'),
+            "no leading blank line after removal: {result:?}"
+        );
         let _ = fs::remove_dir_all(&repo_dir);
     }
 }

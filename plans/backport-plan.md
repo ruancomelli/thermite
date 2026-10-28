@@ -19,7 +19,7 @@ phases run end-to-end; phases requiring human judgment pause with guided prompts
 
 The key complexity in backporting is that an older Ubuntu release may have older versions
 of build dependencies (LLVM, libgit2, cmake, pkgconf, dh-cargo, etc.), requiring manual
-fixes during Phase 6.  thermite cannot automate these since they are situation-specific,
+fixes during Phase 8.  thermite cannot automate these since they are situation-specific,
 but it documents the common fixes inline and links to the reference documentation.
 
 ---
@@ -139,9 +139,8 @@ Returns the list of `http…` lines from stdout.
 
 ### Phase 0 — Preflight Checks (Automated)
 
-- Check required tools on PATH: `git`, `dch`, `uscan`, `dpkg-buildpackage`, `sbuild`,
-  `cargo`, `rustup`, `dput`, `ppa`.  (No `gbp`, `quilt`, `lintian`, or
-  `autopkgtest-buildvm-ubuntu-cloud` — these are only needed by `update`.)
+- Check required tools on PATH: `git`, `dch`, `uscan`, `quilt`, `dpkg-buildpackage`,
+  `lintian`, `sbuild`, `cargo`, `rustup`, `dput`, `ppa`.
 - `git::verify_debian_package_root()` — check `debian/changelog` and `debian/watch` exist.
 - Print parameter summary and ask for confirmation.
 
@@ -158,8 +157,8 @@ Returns the list of `http…` lines from stdout.
 - `git checkout <source_release>-<X.Y>` (e.g. `noble-1.85`)
 - `git checkout -b <release>-<X.Y>` (e.g. `jammy-1.85`)
 
-The branch is pushed to the remote only in Phase 9, once the package is ready for the
-staging PPA.
+The branch is pushed to the remote only in Phase 14, once the package has passed the
+staging PPA autopkgtests.
 
 ### Phase 3 — Update Changelog (Automated)
 
@@ -170,28 +169,47 @@ staging PPA.
 - `changelog::update_backport_changelog_entry()` — sets distribution and bullet.
 - Print the first 6 lines of the updated changelog for review.
 
-### Phase 4 — Generate Orig Tarball (Automated)
+### Phase 4 — Compatibility Checks (Interactive)
 
-- `uscan::run_uscan(repo_dir, rust_ver, log)` — downloads the upstream source.
-- `uscan::rename_tarball_to_canonical()` — strip the uscan-appended `1` suffix.
+- `compat::run_all_checks(repo_dir, release)` — for each of LLVM, libgit2, dh-cargo,
+  pkgconf, cmake, and debhelper-compat, infer the version the source package needs and
+  check whether the target release's archive can satisfy it (via `rmadison -u ubuntu` and
+  `dpkg --compare-versions`).
+- Print a per-gate table (`OK` / `Needs change` / `Could not infer` / `Check failed`) and
+  guide the user through applying any required changes manually.
+- The outcome (especially LLVM or libgit2 vendoring, which change `Files-Excluded` in
+  `debian/copyright`) determines the tarball decisions in Phases 5 and 6.
 
-### Phase 5 — Generate Orig-Vendor Tarball (Automated)
+### Phase 5 — Provide Orig Tarball (Interactive)
 
-- `vendor::ensure_rustup_installed()`
-- `vendor::rustup_install_toolchain(rust_ver)` — installs the toolchain via `rustup`.
-- `vendor::generate_vendor_tarball(repo_dir, bootstrap_dir, rust_ver)`.
+Decision gate offering Reuse / Download / Regenerate / Abort:
 
-### Phase 6 — Local Build and Bug Fixing (Interactive)
+- **Reuse** — no `Files-Excluded` change and the tarball already exists in the parent
+  directory as `rustc-<X.Y>_<X.Y.Z>+dfsg~<series>.orig.tar.xz`.
+- **Download** — attempt an automated fetch (`tarball_fetch::fetch_backport_tarball`):
+  1. the rust-toolchain staging PPA on Launchpad, whose published source files already
+     carry the `~<series>` suffix of a previous backport upload;
+  2. the primary Ubuntu archive, reusing the orig tarball published for the same upstream
+     version (candidate filenames resolved via `rmadison -u ubuntu rustc-<X.Y>`).
+  Both are served by Launchpad `+files` URLs and downloaded with `wget` (or `curl`).
+  When no candidate has the file, fall back to a manual-placement prompt.
+- **Regenerate** — required when `Files-Excluded` changed in Phase 4:
+  `uscan::run_uscan(repo_dir, rust_ver, "~<series>", log)` (20–60 minutes) lands the
+  tarball directly as `rustc-<X.Y>_<X.Y.Z>+dfsg~<series>.orig.tar.xz`.
+- **Abort**.
 
-Loop:
-1. `build::clean_build_artifacts(parent_dir, repo_dir)`
-2. `build::run_sbuild(repo_dir, release, &[])`:
-   - `SbuildResult::Success` → break
-   - `SbuildResult::Failure` → print info-box with build log path and common fix guidance;
-     `prompt_continue`; loop.
+### Phase 6 — Provide Orig-Vendor Tarball (Interactive)
 
-The info-box lists the most common backporting issues (LLVM, libgit2, dh-cargo, pkgconf,
-cmake, OpenSSL) with brief fix instructions and a link to the full backporting guide.
+Same decision gate for `rustc-<X.Y>_<X.Y.Z>+dfsg~<series>.orig-vendor.tar.xz`:
+
+- **Reuse** — the vendor tarball already exists locally.
+- **Download** — same automated fetch (staging PPA, then Ubuntu archive) with a
+  manual-placement fallback.
+- **Regenerate** — delete any stale series-suffixed vendor tarballs, install the matching
+  toolchain via `vendor::rustup_install_toolchain(rust_ver)`, then
+  `vendor::generate_vendor_tarball()` running `debian/rules vendor-tarball` with
+  `RUST_BOOTSTRAP_DIR`.
+- **Abort**.
 
 ### Phase 7 — Disable Autopkgtest Self-Build Test (Automated)
 
@@ -203,7 +221,36 @@ cmake, OpenSSL) with brief fix instructions and a link to the full backporting g
 Rationale: the self-build test is resource-intensive and likely to time out on the
 autopkgtest infrastructure, especially for backports that vendor LLVM.
 
-### Phase 8 — PPA Build (Interactive)
+### Phase 8 — Local Build and Bug Fixing (Interactive)
+
+Loop:
+1. `build::quilt_pop_all(repo_dir)` then `build::clean_build_artifacts(parent_dir, repo_dir)`
+2. `build::run_sbuild(repo_dir, release, extra_args)` with
+   `--extra-repository=deb [trusted=yes] http://ppa.launchpad.net/rust-toolchain/staging/ubuntu/ <release> main`
+   so the bootstrap compiler (`rustc-<X.Y>_old`, `cargo-<X.Y>_old`) resolves from the
+   staging PPA:
+   - `SbuildResult::Success` → break
+   - `SbuildResult::Failure` → print info-box with build log path and common fix guidance;
+     `prompt_continue`; loop.
+
+The info-box lists the most common backporting issues (LLVM, libgit2, dh-cargo, pkgconf,
+cmake, OpenSSL) with brief fix instructions and a link to the full backporting guide.
+
+### Phase 9 — Build Source Package (Interactive)
+
+- Expected `.dsc` path is deterministic: `<parent>/rustc-<X.Y>_<version>.dsc`.
+- `prompt_select`: build now (`build::quilt_pop_all`, `clean_build_artifacts`,
+  `build::run_dpkg_buildpackage_source`) or skip when the `.dsc` already exists.
+- Skipping without a `.dsc` is only safe when Phase 10 will also be skipped.
+
+### Phase 10 — Lintian Checks (Interactive)
+
+- Skippable. Otherwise `lintian::run_lintian(repo_dir, ["-i", "--tag-display-limit", "0"], log)`
+  writes `lintian-<X.Y>-<release>.log` and reports error/warning counts.
+- Print info-box with the expected (ignorable) tags for rustc backports; all other issues
+  must be fixed or overridden in `debian/source/lintian-overrides{,.in}`.
+
+### Phase 11 — PPA Build (Interactive)
 
 - Print info-box with suggested PPA name (`rustc-<X.Y>-<release>`).
 - Optionally create the PPA via `ppa::create_ppa()`.
@@ -213,33 +260,39 @@ autopkgtest infrastructure, especially for backports that vendor LLVM.
 - `git::restore_file(repo_dir, debian/changelog)` — reverts the `~ppa1` entry.
 - Print PPA URL and `prompt_continue`.
 
-### Phase 9 — Staging PPA Upload (Interactive)
+### Phase 12 — Staging PPA Upload (Interactive)
 
 - Print info-box explaining what the changelog description should contain (list of
   backporting changes made).
 - `prompt_continue` then `run_interactive_command("dch", ["-r", "--no-auto-nmu"])` — open
   the user's configured editor with `dch -r` to finalize the changelog entry.
-- `build::run_dpkg_buildpackage_source(repo_dir)`.
-- `find_changes_file(parent_dir)` → `ppa::dput_to_ppa("rust-toolchain/staging", changes)`.
-- `git::push_branch(repo_dir, git_remote, target_branch)` — push the branch now that the
-  package is publicly staged.
-- Print staging PPA URL and `prompt_continue`.
+- Clean artifacts, then `build::run_dpkg_buildpackage_source(repo_dir)`.
+- `find_changes_file(parent_dir)` → `ppa::dput_to_ppa("rust-toolchain/staging", changes)`
+  (honours `--dry-run` via `confirm_sink`).
+- Print staging PPA build-monitoring URL and confirm the build completed on all
+  architectures before continuing.
 
-### Phase 10 — Autopkgtests (Interactive)
+### Phase 13 — Autopkgtests (Interactive)
 
 - `ppa::get_staging_ppa_test_urls(pkg_name, release)` — runs
   `ppa tests ppa:rust-toolchain/staging -p rustc-<X.Y> --release <release> --show-url`.
 - Print all URLs (or a manual fallback message if none returned).
-- `prompt_continue`.
+- Confirm all autopkgtests passed (the self-build test was disabled in Phase 7).
 
-### Phase 11 — Archive Upload (Optional, Interactive)
+### Phase 14 — Push Branch to Foundations Repository (Interactive)
+
+- `git::push_branch(repo_dir, git_remote, target_branch)` (honours `--dry-run`) — the
+  branch is pushed only after the staging build and autopkgtests pass, becoming the
+  authoritative record of the backport.
+
+### Phase 15 — Archive Upload (Optional, Interactive)
 
 - Print info-box explaining that archive upload is only needed if the backport is
   specifically required in the Archive (the staging PPA is sufficient for bootstrapping).
 - List what to include in the Security team request: bug link, staging PPA link,
   package name and version.
 - Print link to the Security Proposed PPA for monitoring.
-- `prompt_continue`.
+- `prompt_select` to finish.
 
 ---
 
@@ -249,7 +302,7 @@ The "Common Backporting Changes" (LLVM vendoring, libgit2 vendoring, pkgconf →
 cmake-mozilla, dh-cargo removal, debhelper-compat downgrade, RISC-V `zicsr`/`zmmul`
 patches, stage0 bootstrap) are situation-specific and require human judgment.
 
-Phase 6 references the documentation and lists common issues, but does not apply these
+Phase 8 references the documentation and lists common issues, but does not apply these
 changes automatically.  This is the same philosophy as `update`'s Phase 9 (Remove
 Vendored C Libraries), which guides but does not automate.
 
@@ -264,5 +317,9 @@ All new pure functions are unit-tested:
   already-versioned source → older-release case.
 - `strip_series_suffix()` and `is_series_like()` — individual unit tests.
 - `disable_self_build_test()` — two cases: block present (removed), block absent (no-op).
+- `tarball_fetch::expected_backport_tarball_name()` — both tarball kinds.
+- `tarball_fetch::launchpad_files_url()` — `+` percent-encoding, `~` preserved.
+- `tarball_fetch::parse_rmadison_upstream_versions()` — matching, series-suffixed,
+  non-matching, and malformed rmadison lines.
 - `BackportParams::new()` — invalid lpuser, invalid bug number, same source/target release.
 - `find_changes_file()` in `backport.rs` — newest-file selection.

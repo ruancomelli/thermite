@@ -175,34 +175,41 @@ Build a table of the form:
 
 Using the table from § 1.2, derive the complete ordered list of `(X.Y, source_release, release)` triples.
 
+**The backport chain.** Backports traverse the **LTS+devel chain**: the current devel release,
+then each LTS release newest-to-oldest. Today the chain is:
+
+```
+Stonking (devel) → Resolute (26.04 LTS) → Noble (24.04 LTS) → Jammy (22.04 LTS) → Focal (20.04 LTS)
+```
+
+Backports go **one release at a time** along this chain so that release-specific failures are
+isolated and each step has a stable checkpoint. Non-LTS, non-devel releases (e.g. Oracular,
+Questing) are not on the chain; thermite warns when a backport involves a non-LTS release.
+
 **Algorithm:**
 
 1. For the final target release (e.g. Jammy), list every Rust version between the current version
    in that release (exclusive) and the desired target version (inclusive). These are all the
    intermediate versions that must be backported.
-2. For each intermediate version, backport it from the release that was just above it in the chain,
-   working top-down through the release list.
-3. For each `(X.Y, release)` pair, the `source_release` is the next higher Ubuntu release that
+2. For each intermediate version, backport it from the release that is one step above it on the
+   chain, working top-down.
+3. For each `(X.Y, release)` pair, the `source_release` is the next release up the chain that
    already has `X.Y` either in its archive or in the staging PPA.
 
-**Example — backporting `rustc-1.86` to Jammy:**
+**Example — backporting `rustc-1.86` to Jammy from Resolute:**
 
 | Step | X.Y    | source_release | release |
 | ---- | ------ | -------------- | ------- |
-| 1    | `1.84` | Plucky         | Noble   |
-| 2    | `1.84` | Noble          | Jammy   |
-| 3    | `1.85` | Plucky         | Noble   |
-| 4    | `1.85` | Noble          | Jammy   |
-| 5    | `1.86` | Questing       | Plucky  |
-| 6    | `1.86` | Plucky         | Noble   |
-| 7    | `1.86` | Noble          | Jammy   |
+| 1    | `1.86` | Stonking (devel) | Resolute |
+| 2    | `1.86` | Resolute       | Noble   |
+| 3    | `1.86` | Noble          | Jammy   |
 
 Execute each row in the order given. Do not start row N+1 until row N's package has successfully
 built and been uploaded to the staging PPA (§ 3.9).
 
 > **Requires:** Archive and staging PPA queried for current rustc versions.  
-> **Ensures:** A complete, ordered work plan of `(X.Y, source_release, release)` triples exists.  
-> **On failure:** If the current archive state is unexpected (e.g. a version is present in Noble but not in Plucky), investigate before proceeding. The chain must be consistent.
+> **Ensures:** A complete, ordered work plan of `(X.Y, source_release, release)` triples exists, with each step adjacent on the LTS+devel chain.  
+> **On failure:** If the current archive state is unexpected (e.g. a version is present in Noble but not in Resolute), investigate before proceeding. The chain must be consistent.
 
 ---
 
@@ -267,23 +274,47 @@ All commands are run from inside `~/rustc/rustc/` unless otherwise specified.
 Start from the branch for `<X.Y>` on `<source_release>` — that is, the packaging that already
 works on the newer release — and create a new branch targeting `<release>`.
 
+When `<source_release>` is a **stable** release, the source branch is named
+`<source_release>-<X.Y>`. When `<source_release>` is the **current development
+release**, no `<source_release>-<X.Y>` branch exists yet — the authoritative
+packaging lives on the `merge-<X.Y>` branch instead. thermite probes the
+Foundations remote and picks the correct branch automatically; the commands
+below show the stable-release case.
+
+`--source-release devel` is accepted as a shorthand for the current development
+release (resolved to its concrete adjective, e.g. `stonking`). The target
+release (`--release`) must always be a concrete adjective — `devel` is not a
+valid backport target.
+
 ```shell
 git fetch origin
 git checkout <source_release>-<X.Y>
 git checkout -b <release>-<X.Y>
 ```
 
-**Example** — backporting `rustc-1.85` to Jammy from Noble:
+**Example** — backporting `rustc-1.85` to Jammy from Noble (stable source):
 
 ```shell
 git checkout noble-1.85
 git checkout -b jammy-1.85
 ```
 
-> **Requires:** The `<source_release>-<X.Y>` branch exists on `origin` and is up to date.  
-> **Ensures:** You are on a new local branch `<release>-<X.Y>` whose tip matches `<source_release>-<X.Y>`.  
-> **On failure:** If the source branch does not exist, the `source_release` backport (from § 1.3) has
-> not yet been completed. Complete that step first.
+**Example** — backporting `rustc-1.85` to Resolute from Stonking (devel source):
+
+```shell
+# No 'stonking-1.85' branch exists yet; use 'merge-1.85' instead.
+# `thermite backport -s devel -r resolute -u 1.85.0` resolves 'devel' to 'stonking'.
+git checkout merge-1.85
+git checkout -b resolute-1.85
+```
+
+> **Requires:** The `<source_release>-<X.Y>` branch exists on `origin` and is up to date,
+> **or** `<source_release>` is the current devel release and `merge-<X.Y>` exists on `origin`.  
+> **Ensures:** You are on a new local branch `<release>-<X.Y>` whose tip matches the resolved
+> source branch (`<source_release>-<X.Y>` for stable sources, `merge-<X.Y>` for the devel source).  
+> **On failure:** If neither `<source_release>-<X.Y>` nor `merge-<X.Y>` exists on `origin`, the
+> `source_release` backport (from § 1.3) has not yet been completed. Complete that step first,
+> or enter the correct source branch name when thermite prompts for it.
 
 ---
 
@@ -388,13 +419,31 @@ This step takes 20–60 minutes. The log file is useful for debugging.
 #### 3.3.2 Downloading the Orig Tarball from Launchpad
 
 If no changes to `Files-Excluded` were made, the tarball can be reused from a prior upload.
-Find it under the package files for either the Ubuntu Archive or the staging PPA:
+When the **Download** option is selected in thermite, it attempts an automated fetch from,
+in order:
 
-```
-https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages
-```
+1. The rust-toolchain staging PPA, whose published source files already carry the
+   `~<release_number>` suffix of a previous backport upload:
 
-Download the `.orig.tar.xz` file and place it in `~/rustc/`.
+   ```
+   https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+files/<filename>
+   ```
+
+2. The primary Ubuntu archive, reusing the `.orig.tar.xz` published for the same upstream
+   version (candidate filenames are resolved with `rmadison -u ubuntu rustc-<X.Y>`):
+
+   ```
+   https://launchpad.net/ubuntu/+archive/primary/+files/<filename>
+   ```
+
+Downloads use `wget` (or `curl`) and are saved directly under the expected
+`rustc-<X.Y>_<X.Y.Z>+dfsg~<release_number>.orig.tar.xz` name in `~/rustc/`.
+
+If neither source has the tarball (e.g. this is the first backport attempt for the
+version), thermite falls back to a manual-placement prompt: download the `.orig.tar.xz`
+file from the staging PPA package page at
+`https://launchpad.net/~rust-toolchain/+archive/ubuntu/staging/+packages`, name it exactly
+as prompted, and place it in `~/rustc/`.
 
 #### 3.3.3 Generating the Vendor Tarball (Rust 1.89+)
 
@@ -1006,13 +1055,40 @@ packaged toolchain. This test validates that the packaged compiler can bootstrap
 versions. However, for backports — especially those that vendor LLVM — this test is resource-
 intensive and frequently times out on the `autopkgtest` infrastructure.
 
-Remove the self-build test stanza from `debian/tests/control`:
+Remove the self-build test stanza from `debian/tests/control`. Upstream Debian
+has used two stanza shapes so far; both are removed by thermite automatically.
+
+**Pattern A** (older Rust packaging, 3 lines):
 
 ```diff
--Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
--Depends: @, @builddeps@
--Restrictions: rw-build-tree, allow-stderr
+ -Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+ -Depends: @, @builddeps@
+ -Restrictions: rw-build-tree, allow-stderr
 ```
+
+**Pattern B** (newer Rust packaging, 6 lines — adds two comments and an
+`Architecture:` restriction):
+
+```diff
+ -Test-Command: ./debian/rules build RUST_TEST_SELFBUILD=1
+ -Depends: @, @builddeps@
+ -Restrictions: rw-build-tree, allow-stderr
+ -# Other arches work but are flaky due to memory limitations.
+ -# Additionally, the test doesn't test for anything arch-specific.
+ -Architecture: amd64
+```
+
+If the stanza in `debian/tests/control` does not match either shape — for
+example because upstream added a new field, changed a comment, or altered the
+`Architecture:` list — thermite will **not** edit the file (to avoid leaving it
+half-removed and broken). It prints the documentation link below and prompts
+you to either:
+
+1. manually delete the whole stanza in `debian/tests/control` and commit the
+   change, then continue; or
+2. skip the removal, leaving the self-build autopkgtest active (it will likely
+   time out on the autopkgtest infrastructure — if this backport vendors LLVM,
+   prefer option 1).
 
 > **Note:** The build process still performs internal bootstrapping: the previous-version compiler
 > builds a stage1 compiler, which then builds the stage2 compiler that gets packaged. This is
@@ -1024,6 +1100,8 @@ Remove the self-build test stanza from `debian/tests/control`:
 > **Ensures:** `debian/tests/control` does not contain the `RUST_TEST_SELFBUILD=1` stanza.  
 > **On failure:** This step cannot fail. If the stanza is already absent from
 > `debian/tests/control`, it was removed in a prior step or upstream — no action needed.
+> If the stanza shape is not recognised, thermite prompts for manual removal
+> (or skipping); it never writes a partially-edited `debian/tests/control`.
 
 ---
 

@@ -38,6 +38,29 @@ pub async fn branch_exists(repo_dir: &Path, branch: &str) -> Result<bool> {
     Ok(!output.stdout.trim().is_empty())
 }
 
+/// Returns `true` if `branch` exists on `remote` (without checking it out).
+///
+/// Uses `git ls-remote --heads <remote> <branch>`, which exits 0 and prints the
+/// matching ref to stdout when the branch exists on the remote, or prints
+/// nothing and still exits 0 when it does not. This is preferable to a local
+/// `git branch --list` for probing branches that have not yet been fetched
+/// (or that the local clone may not have a remote-tracking ref for).
+///
+/// Returns `false` rather than erroring when the remote is unknown to git;
+/// callers that need to distinguish "remote not configured" from "branch
+/// absent on a configured remote" can inspect the underlying `Result` via the
+/// `?`-propagated error from `run_command`.
+pub async fn remote_branch_exists(repo_dir: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let output = run_command(
+        "git",
+        &["ls-remote", "--heads", remote, branch],
+        repo_dir,
+        &[],
+    )
+    .await?;
+    Ok(!output.stdout.trim().is_empty())
+}
+
 /// Check out an existing branch.
 pub async fn checkout_branch(repo_dir: &Path, branch: &str) -> Result<()> {
     run_command("git", &["checkout", branch], repo_dir, &[]).await?;
@@ -171,8 +194,8 @@ mod tests {
     /// Regression: when `file` is constructed as `repo_dir.join(relative)` and
     /// `repo_dir` is itself a relative path (e.g. `../some/repo`), `git restore`
     /// must receive only the repo-root-relative portion (`relative`), not the
-    /// full path which git would interpret relative to its cwd and reject as
-    /// "outside repository".
+    /// full path which git would interpret relative to its own cwd and reject
+    /// as "outside repository".
     ///
     /// We can't run real git here, so we just assert that `strip_prefix` on the
     /// constructed path yields the expected relative component.
@@ -182,5 +205,104 @@ mod tests {
         let file = repo_dir.join("debian/changelog");
         let relative = file.strip_prefix(&repo_dir).unwrap();
         assert_eq!(relative, std::path::Path::new("debian/changelog"));
+    }
+
+    /// `remote_branch_exists` must report `true` for a branch that exists on the
+    /// remote and `false` for one that does not. We build a minimal two-repo
+    /// fixture (a bare "remote" plus a working clone), push a branch, and probe
+    /// both names.
+    #[tokio::test]
+    async fn remote_branch_exists_detects_present_and_absent_branches() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "thermite-remote-branch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let remote_path = tmp.join("remote.git");
+        fs::create_dir_all(&remote_path).unwrap();
+
+        // Initialise a bare repository to act as the remote.
+        run_command(
+            "git",
+            &["init", "--bare", remote_path.to_str().unwrap()],
+            &tmp,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Clone the bare remote into a working repo we can commit to.
+        let work = tmp.join("work");
+        run_command(
+            "git",
+            &[
+                "clone",
+                remote_path.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+            &tmp,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Configure identity and create an initial commit on `main`.
+        run_command("git", &["config", "user.email", "t@t"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["config", "user.name", "t"], &work, &[])
+            .await
+            .unwrap();
+        fs::write(work.join("README"), "init\n").unwrap();
+        run_command("git", &["add", "README"], &work, &[])
+            .await
+            .unwrap();
+        run_command(
+            "git",
+            &["commit", "-m", "init", "--allow-empty"],
+            &work,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // `git init --bare` may default to `master` or `main` depending on git
+        // version; rename to `main` so the push below targets a known name.
+        run_command("git", &["branch", "-M", "main"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["push", "-u", "origin", "main"], &work, &[])
+            .await
+            .unwrap();
+
+        // Create and push the branch we want to probe for.
+        run_command("git", &["checkout", "-b", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+        run_command("git", &["push", "origin", "noble-1.85"], &work, &[])
+            .await
+            .unwrap();
+
+        // The probe must succeed for the branch that exists...
+        assert!(
+            remote_branch_exists(&work, "origin", "noble-1.85")
+                .await
+                .unwrap(),
+            "noble-1.85 should be reported as present on origin"
+        );
+        // ...and fail for one that does not.
+        assert!(
+            !remote_branch_exists(&work, "origin", "stonking-1.85")
+                .await
+                .unwrap(),
+            "stonking-1.85 should be reported as absent on origin"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

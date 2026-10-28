@@ -308,16 +308,19 @@ pub fn comment_out_vendor_exclusion(copyright_path: &Path) -> Result<()>
 
 1. Run:
    ```
-   uscan --download-version <X.Y.Z> -v 2>&1 | tee <log_path>
+   uscan --download-version <X.Y.Z> -v --destdir <staging_dir> 2>&1 | tee <log_path>
    ```
-   Capture and display `uscan` output. Log is saved to a timestamped file in the working directory.
+   Capture and display `uscan` output. Log is saved to a file in the working directory.
 
-2. Rename the resulting orig tarball with the `~old` suffix:
+2. Move the resulting orig tarball into the parent directory with the `~old` suffix:
    ```
-   mv ../rustc-<X.Y>_<X.Y.Z>+dfsg.orig.tar.xz  ../rustc-<X.Y>_<X.Y.Z>+dfsg~old.orig.tar.xz
+   <staging_dir>/rustc-<X.Y>_<X.Y.Z>+dfsg.orig.tar.xz → ../rustc-<X.Y>_<X.Y.Z>+dfsg~old.orig.tar.xz
    ```
-   (More precisely: the generated name ends in `1` per uscan conventions; the rename is
-   `rustc-<X.Y>_<X.Y.Z>+dfsg{1,~old}.orig.tar.xz`.)
+   uscan downloads into a private staging directory (`<parent>/.thermite/uscan-<version>-…`,
+   removed afterwards), so the produced tarball is unambiguous even when several backports
+   share the same worktree. The dfsg suffix in the produced name follows the watch file's
+   `repacksuffix` (`+dfsg` for rustc-1.97 and newer, `+dfsg1` for older packages) and is
+   normalised away: the tarball lands directly under its final name.
 
 3. Restore `debian/copyright` to remove the temporary vendor comment:
    ```
@@ -326,8 +329,7 @@ pub fn comment_out_vendor_exclusion(copyright_path: &Path) -> Result<()>
 
 **Key function signatures:**
 ```rust
-pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, log_path: &Path) -> Result<PathBuf>
-pub fn rename_tarball_with_suffix(tarball: &Path, suffix: &str) -> Result<PathBuf>
+pub async fn run_uscan(repo_dir: &Path, version: &RustVersion, dfsg_suffix: &str, log_path: &Path) -> Result<PathBuf>
 pub async fn git_restore_file(repo_dir: &Path, file: &Path) -> Result<()>
 ```
 
@@ -483,11 +485,11 @@ Now that the vendor tarball is pruned, regenerate the main orig tarball (without
    `debian/copyright`.
 2. Run `uscan` again (without the vendor):
    ```
-   uscan --download-version <X.Y.Z> -v 2>&1 | tee <log_path>
+   uscan --download-version <X.Y.Z> -v --destdir <staging_dir> 2>&1 | tee <log_path>
    ```
-3. Rename the tarball to the canonical format (no numeric suffix):
+3. Move the tarball to the canonical format (no suffix):
    ```
-   mv ../rustc-<X.Y>_<X.Y.Z>+dfsg{1,}.orig.tar.xz
+   <staging_dir>/rustc-<X.Y>_<X.Y.Z>+dfsg.orig.tar.xz → ../rustc-<X.Y>_<X.Y.Z>+dfsg.orig.tar.xz
    ```
 4. Create a backup branch:
    ```

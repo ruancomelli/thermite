@@ -166,9 +166,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     let log_dir = parent_dir.clone();
     let uscan_log = log_dir.join(format!("uscan-{new_ver}-first.log"));
     info!("running uscan --download-version {new_ver}");
-    let tarball = uscan::run_uscan(repo_dir, new_ver, &uscan_log).await?;
-    info!("renaming tarball with ~old suffix");
-    let old_tarball = uscan::rename_tarball_with_suffix(&tarball, "~old")?;
+    let old_tarball = uscan::run_uscan(repo_dir, new_ver, "~old", &uscan_log).await?;
     println!(
         "  Orig tarball (with full vendor): {}",
         old_tarball.display()
@@ -229,8 +227,7 @@ pub async fn run(params: &UpdateParams, repo_dir: &Path) -> Result<()> {
     // Regenerate the main orig tarball without the vendor directory.
     let uscan_log2 = log_dir.join(format!("uscan-{new_ver}-final.log"));
     info!("running uscan again for final orig tarball");
-    let tarball2 = uscan::run_uscan(repo_dir, new_ver, &uscan_log2).await?;
-    let final_tarball = uscan::rename_tarball_to_canonical(&tarball2)?;
+    let final_tarball = uscan::run_uscan(repo_dir, new_ver, "", &uscan_log2).await?;
     println!("  Final orig tarball: {}", final_tarball.display());
 
     // Create a backup branch.

@@ -56,6 +56,14 @@ thermite also uses the `lpcli` skill to create bug reports and manage interactio
 ## Coding Standards
 - Follow idiomatic Rust practices and community standards as defined in `.github/instructions/rust.instructions.md`.
 
+## Development Checks
+Before committing or opening a pull request, run all of the following locally and ensure each succeeds. CI runs the same commands and will fail the build if any of them emit output or exit non-zero.
+
+- **Formatting:** `cargo fmt -- --check` — must produce no output. Run `cargo fmt` (without `--check`) to apply fixes if it reports drift.
+- **Lints:** `cargo clippy --locked --all-targets --all-features -- -D warnings` — must exit 0. Treat every warning as an error.
+- **Docs:** `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features` — must exit 0. Intra-doc links must resolve and must not point at private items (refer to private items in plain text, not `[`…`]` links).
+- **Tests:** `cargo test --locked --all-features` — must exit 0.
+
 ## Persona
 You are an Ubuntu expert with deep knowledge of Ubuntu releases and packages. You provide guidance on best practices for managing Ubuntu source packages and help troubleshoot issues related to package downloads and release compatibility.
 
