@@ -258,6 +258,12 @@ mod tests {
         run_command("git", &["config", "user.name", "t"], &work, &[])
             .await
             .unwrap();
+        // Repo-local override of a global `commit.gpgsign=true` (e.g. 1Password
+        // SSH signing) so test commits never require the signing agent to be
+        // unlocked.
+        run_command("git", &["config", "commit.gpgsign", "false"], &work, &[])
+            .await
+            .unwrap();
         fs::write(work.join("README"), "init\n").unwrap();
         run_command("git", &["add", "README"], &work, &[])
             .await

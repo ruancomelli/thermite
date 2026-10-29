@@ -54,7 +54,7 @@ thermite makes heavy use of the `debian-packaging` skill.  This skill provides f
 thermite also uses the `lpcli` skill to create bug reports and manage interactions with Launchpad.  This skill is used in both the 'update' and 'backport' workflows to create bug reports for the work being done, and to manage interactions with Launchpad throughout the packaging process.
 
 ## Coding Standards
-- Follow idiomatic Rust practices and community standards as defined in `.github/instructions/rust.instructions.md`.
+- Follow idiomatic Rust practices and community standards as defined in `rust-instructions.md`.
 
 ## Development Checks
 Before committing or opening a pull request, run all of the following locally and ensure each succeeds. CI runs the same commands and will fail the build if any of them emit output or exit non-zero.

@@ -92,7 +92,15 @@ pub fn debian_version_string(version: &RustVersion) -> String {
 ///
 /// Returns an error if the file cannot be read or the format is unexpected.
 pub fn read_current_version(changelog_path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(changelog_path)?;
+    let content = std::fs::read_to_string(changelog_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // Missing changelog almost always means "not a Debian source
+            // package" — say that instead of a bare IO error.
+            crate::error::ThermiteError::MissingChangelog(changelog_path.display().to_string())
+        } else {
+            crate::error::ThermiteError::Io(e)
+        }
+    })?;
     let first_line = content.lines().next().unwrap_or("");
     // Extract the version between the first `(` and `)`.
     let version = first_line
@@ -408,6 +416,24 @@ rustc-1.95 (1.95.0+dfsg-0ubuntu1) plucky; urgency=medium
         let path = dir.join("changelog");
         std::fs::write(&path, SAMPLE_CHANGELOG).unwrap();
         path
+    }
+
+    #[test]
+    fn read_current_version_missing_changelog_is_clear() {
+        // Not a Debian source package → the error must say so, not surface a
+        // bare "No such file or directory (os error 2)".
+        let dir = make_scratch_dir("missing-changelog");
+        let path = dir.join("debian/changelog");
+        let err = read_current_version(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ThermiteError::MissingChangelog(_)
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a Debian source package") && msg.contains("missing debian/changelog"),
+            "unexpected message: {msg}"
+        );
     }
 
     #[test]

@@ -35,6 +35,15 @@ pub enum ThermiteError {
     #[error("debian package root not found at '{0}': missing debian/changelog or debian/watch")]
     NotADebianPackageRoot(String),
 
+    /// A `debian/changelog` file was expected at a path but does not exist.
+    ///
+    /// Raised when the target directory does not look like a Debian source
+    /// package (e.g. `thermite version` / `thermite tui` run outside a
+    /// packaging repo), so the user gets a hint instead of a bare
+    /// "No such file or directory".
+    #[error("not a Debian source package: missing debian/changelog at '{0}'")]
+    MissingChangelog(String),
+
     /// Launchpad username was empty or otherwise invalid.
     #[error("invalid Launchpad username: {0}")]
     InvalidLpUser(String),
