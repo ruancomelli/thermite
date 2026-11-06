@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::cache;
 use crate::error::{Result, ThermiteError};
 use crate::shell::{run_command, run_interactive_command};
 use crate::types::versions::{RustVersion, ShortRustVersion};
@@ -158,25 +159,38 @@ pub async fn fetch_tarball(
         format!("staging PPA ({name})"),
     )];
     let rmadison_query = format!("rustc-{rust_short}");
-    match run_command(
-        "rmadison",
-        &["-u", "ubuntu", &rmadison_query],
-        Path::new("."),
-        &[],
-    )
-    .await
-    {
-        Ok(output) => {
-            for upstream in parse_rmadison_upstream_versions(&output.stdout, &rust_ver.to_string())
-            {
-                let archive_name = format!("rustc-{rust_short}_{upstream}{}", kind.tail());
-                candidates.push((
-                    launchpad_files_url(PRIMARY_ARCHIVE_FILES_BASE, &archive_name),
-                    format!("Ubuntu archive ({archive_name})"),
-                ));
-            }
+    let rmadison_stdout = match cache::lookup_rmadison(&rmadison_query) {
+        Some(hit) => {
+            crate::shell::out_line(&format!(
+                "  rmadison: using cached result for {rmadison_query} ({})",
+                cache::format_age(hit.age_secs)
+            ));
+            hit.data
         }
-        Err(_) => crate::shell::out_line("  rmadison failed — skipping Ubuntu archive candidates"),
+        None => match run_command(
+            "rmadison",
+            &["-u", "ubuntu", &rmadison_query],
+            Path::new("."),
+            &[],
+        )
+        .await
+        {
+            Ok(output) => {
+                cache::store_rmadison(&rmadison_query, &output.stdout);
+                output.stdout
+            }
+            Err(_) => {
+                crate::shell::out_line("  rmadison failed — skipping Ubuntu archive candidates");
+                String::new()
+            }
+        },
+    };
+    for upstream in parse_rmadison_upstream_versions(&rmadison_stdout, &rust_ver.to_string()) {
+        let archive_name = format!("rustc-{rust_short}_{upstream}{}", kind.tail());
+        candidates.push((
+            launchpad_files_url(PRIMARY_ARCHIVE_FILES_BASE, &archive_name),
+            format!("Ubuntu archive ({archive_name})"),
+        ));
     }
 
     for (url, label) in &candidates {

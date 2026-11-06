@@ -361,6 +361,16 @@ mod backport_changelog_tests {
     }
 
     #[test]
+    fn compute_backport_version_falls_back_for_older_style_versions() {
+        // Legacy `~<series>.<N>`-only versions don't parse under the new
+        // schema; the legacy fallback must still re-target them correctly.
+        assert_eq!(
+            compute_backport_version("1.61.0+dfsg1-0ubuntu2~22.04.1", "20.04"),
+            "1.61.0+dfsg1~20.04-0ubuntu2~20.04.1"
+        );
+    }
+
+    #[test]
     fn strip_series_suffix_with_sub_revision() {
         assert_eq!(strip_series_suffix("0ubuntu3~24.04.2"), "0ubuntu3");
         assert_eq!(strip_series_suffix("1.89.0+dfsg2~24.04.1"), "1.89.0+dfsg2");

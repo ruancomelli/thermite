@@ -92,7 +92,7 @@ impl RustcPackageVersion {
         let upstream = RustVersion::parse(before_dfsg)?;
 
         // Parse what comes after "+dfsg": [<repack_number>][~<series>[.<bp_repack>]][~stage0]
-        let (repack_number, after_repack) = parse_repack_number(after_dfsg);
+        let (repack_number, after_repack) = parse_repack_number(after_dfsg)?;
 
         // Check for ~stage0 and ~<series>[.<backport_repack>]
         let (series, backport_repack, stage0) = parse_upstream_suffixes(after_repack)?;
@@ -102,7 +102,8 @@ impl RustcPackageVersion {
         let (debian_rev_main, ppa) = strip_ppa_suffix(debian_rev);
 
         // Format: 0ubuntu<ubuntu_revision>[~<series>.<backport_revision>]
-        let (ubuntu_revision, backport_revision) = parse_debian_revision(debian_rev_main, s)?;
+        let (ubuntu_revision, backport_revision) =
+            parse_debian_revision(debian_rev_main, s, series.as_deref())?;
 
         Ok(Self {
             upstream,
@@ -131,6 +132,7 @@ impl RustcPackageVersion {
     /// - Sets `series` to the target series.
     /// - Resets `backport_repack` to `None`.
     /// - Resets `backport_revision` to `1`.
+    /// - Clears the stage0 marker (`stage0 = false`).
     /// - Clears `ppa` suffix.
     /// - Preserves `upstream`, `repack_number`, and `ubuntu_revision`.
     ///
@@ -423,9 +425,9 @@ fn strip_ppa_suffix(s: &str) -> (&str, Option<u32>) {
 /// Returns `(repack_number, remaining_str)`.
 /// If the first character(s) after `+dfsg` are digits, those form the repack
 /// number. Otherwise `repack_number` is `None`.
-fn parse_repack_number(s: &str) -> (Option<u32>, &str) {
+fn parse_repack_number(s: &str) -> Result<(Option<u32>, &str)> {
     if s.is_empty() {
-        return (None, s);
+        return Ok((None, s));
     }
 
     // Count leading digits.
@@ -437,12 +439,16 @@ fn parse_repack_number(s: &str) -> (Option<u32>, &str) {
         .unwrap_or(0);
 
     if digit_end == 0 {
-        return (None, s);
+        return Ok((None, s));
     }
 
     let num_str = &s[..digit_end];
-    let number = num_str.parse::<u32>().ok();
-    (number, &s[digit_end..])
+    let number = num_str.parse::<u32>().map_err(|_| {
+        ThermiteError::InvalidRustVersion(format!(
+            "repack number '{num_str}' after '+dfsg' is not a valid number"
+        ))
+    })?;
+    Ok((Some(number), &s[digit_end..]))
 }
 
 /// Parse the suffixes after the repack number in the upstream part.
@@ -529,7 +535,16 @@ fn parse_series_and_repack(s: &str) -> Result<(String, Option<u32>)> {
 /// Expected formats:
 /// - `"0ubuntu<N>"` (non-backport)
 /// - `"0ubuntu<N>~<series>.<backport_revision>"` (backport)
-fn parse_debian_revision(rev: &str, full_version: &str) -> Result<(u32, Option<u32>)> {
+///
+/// The optional backport suffix must agree with the series in the upstream
+/// part: a suffix without an upstream series, a series mismatch, or an
+/// upstream series without a suffix are all rejected so that [`Display`]
+/// never silently rewrites them.
+fn parse_debian_revision(
+    rev: &str,
+    full_version: &str,
+    upstream_series: Option<&str>,
+) -> Result<(u32, Option<u32>)> {
     // Must start with "0ubuntu"
     let after_0ubuntu = rev.strip_prefix("0ubuntu").ok_or_else(|| {
         ThermiteError::InvalidRustVersion(format!(
@@ -538,48 +553,74 @@ fn parse_debian_revision(rev: &str, full_version: &str) -> Result<(u32, Option<u
     })?;
 
     // Split on '~' to find the optional backport suffix.
-    if let Some((revision_str, backport_suffix)) = after_0ubuntu.split_once('~') {
-        let ubuntu_rev = revision_str.parse::<u32>().map_err(|_| {
-            ThermiteError::InvalidRustVersion(format!(
-                "invalid ubuntu revision number '{revision_str}' in '{full_version}'"
-            ))
-        })?;
+    match after_0ubuntu.split_once('~') {
+        Some((revision_str, backport_suffix)) => {
+            let ubuntu_rev = revision_str.parse::<u32>().map_err(|_| {
+                ThermiteError::InvalidRustVersion(format!(
+                    "invalid ubuntu revision number '{revision_str}' in '{full_version}'"
+                ))
+            })?;
 
-        // backport_suffix should be "<series>.<backport_revision>"
-        // The series is XX.YY and the backport_revision is the last segment.
-        let bp_rev = parse_backport_revision_from_suffix(backport_suffix, full_version)?;
+            let (suffix_series, bp_rev) =
+                parse_backport_revision_from_suffix(backport_suffix, full_version)?;
+            match upstream_series {
+                None => {
+                    return Err(ThermiteError::InvalidRustVersion(format!(
+                        "backport revision suffix '~{backport_suffix}' in '{full_version}' \
+                         but no '~<series>' in the upstream part"
+                    )));
+                }
+                Some(series) if series != suffix_series => {
+                    return Err(ThermiteError::InvalidRustVersion(format!(
+                        "series mismatch in '{full_version}': upstream has '~{series}' \
+                         but debian revision has '~{suffix_series}'"
+                    )));
+                }
+                _ => {}
+            }
 
-        Ok((ubuntu_rev, Some(bp_rev)))
-    } else {
-        // No '~' — plain ubuntu revision.
-        let ubuntu_rev = after_0ubuntu.parse::<u32>().map_err(|_| {
-            ThermiteError::InvalidRustVersion(format!(
-                "invalid ubuntu revision number '{after_0ubuntu}' in '{full_version}'"
-            ))
-        })?;
-        Ok((ubuntu_rev, None))
+            Ok((ubuntu_rev, Some(bp_rev)))
+        }
+        None => {
+            if let Some(series) = upstream_series {
+                return Err(ThermiteError::InvalidRustVersion(format!(
+                    "backport series '~{series}' in '{full_version}' but debian revision \
+                     '{rev}' is missing the '~<series>.<backport_revision>' suffix"
+                )));
+            }
+            // No '~' — plain ubuntu revision.
+            let ubuntu_rev = after_0ubuntu.parse::<u32>().map_err(|_| {
+                ThermiteError::InvalidRustVersion(format!(
+                    "invalid ubuntu revision number '{after_0ubuntu}' in '{full_version}'"
+                ))
+            })?;
+            Ok((ubuntu_rev, None))
+        }
     }
 }
 
-/// Parse the backport revision from the suffix after `~` in the debian revision.
+/// Parse the `<series>.<backport_revision>` suffix after `~` in the debian
+/// revision.
 ///
-/// The suffix has the form `<series>.<backport_revision>` where series is `XX.YY`.
-/// So the full suffix looks like `XX.YY.N` — the last dot-separated segment is
-/// the backport revision.
-fn parse_backport_revision_from_suffix(suffix: &str, full_version: &str) -> Result<u32> {
-    // The suffix is "XX.YY.N" — we want the last segment.
-    let last_dot = suffix.rfind('.').ok_or_else(|| {
+/// The suffix must have exactly three dot-separated numeric segments, e.g.
+/// `"24.04.1"`. Returns `(series, backport_revision)`.
+fn parse_backport_revision_from_suffix(suffix: &str, full_version: &str) -> Result<(String, u32)> {
+    let invalid = || {
         ThermiteError::InvalidRustVersion(format!(
-            "expected '<series>.<backport_revision>' but got '{suffix}' in '{full_version}'"
+            "expected '<series>.<backport_revision>' (e.g. '~24.04.1') but got \
+             '~{suffix}' in '{full_version}'"
         ))
-    })?;
+    };
+    let parts: Vec<&str> = suffix.split('.').collect();
+    let all_numeric = parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if parts.len() != 3 || !all_numeric {
+        return Err(invalid());
+    }
 
-    let bp_rev_str = &suffix[last_dot + 1..];
-    bp_rev_str.parse::<u32>().map_err(|_| {
-        ThermiteError::InvalidRustVersion(format!(
-            "invalid backport revision '{bp_rev_str}' in '{full_version}'"
-        ))
-    })
+    let bp_rev = parts[2].parse::<u32>().map_err(|_| invalid())?;
+    Ok((format!("{}.{}", parts[0], parts[1]), bp_rev))
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +897,38 @@ mod tests {
     #[test]
     fn parse_non_numeric_ubuntu_revision() {
         assert!(RustcPackageVersion::parse("1.85.0+dfsg-0ubuntux").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_repack_number_overflow() {
+        // The digits must not be silently swallowed when they don't fit u32.
+        assert!(RustcPackageVersion::parse("1.95.0+dfsg99999999999-0ubuntu1").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_debian_suffix_without_upstream_series() {
+        // A valid legacy-style Debian version: the '~22.04.1' series suffix
+        // must not be silently dropped by a "successful" parse.
+        assert!(RustcPackageVersion::parse("1.61.0+dfsg1-0ubuntu2~22.04.1").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_suffix_without_backport_revision() {
+        // '~24.04' is not a valid '<series>.<backport_revision>' suffix; it
+        // must not be misread as series 24, revision 04.
+        assert!(RustcPackageVersion::parse("1.90.0+dfsg2~24.04-0ubuntu1~24.04").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_series_mismatch_between_upstream_and_revision() {
+        assert!(RustcPackageVersion::parse("1.90.0+dfsg2~24.04-0ubuntu3~22.04.1").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_backport_series_without_revision_suffix() {
+        // A series in the upstream part requires '~<series>.<N>' in the
+        // debian revision; Display would otherwise fabricate '.1'.
+        assert!(RustcPackageVersion::parse("1.90.0+dfsg2~24.04-0ubuntu3").is_err());
     }
 
     // --- Doc examples from version-strings.md ---

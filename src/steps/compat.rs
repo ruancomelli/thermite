@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use crate::cache;
 use crate::error::ThermiteError;
 use crate::shell::{run_command, which};
 
@@ -321,9 +322,25 @@ fn is_word_boundary(b: u8) -> bool {
 /// Check whether `package` is published in the `release` suite of the Ubuntu
 /// archive using `rmadison -u ubuntu <package>`.
 ///
+/// The raw rmadison output is cached per query under the user cache directory
+/// (see [`crate::cache`]); repeated backports against the same query reuse the
+/// stored result instead of re-querying the archive. A cache hit needs no
+/// local `rmadison` binary, so the availability check only guards the
+/// network-fetch path.
+///
 /// Returns the version string of the first matching entry, or `NotPublished`
 /// when no entry matches the release.
 pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
+    if let Some(hit) = cache::lookup_rmadison(package) {
+        println!(
+            "  rmadison: using cached result for {package} ({})",
+            cache::format_age(hit.age_secs)
+        );
+        return match parse_rmadison_version(&hit.data, release) {
+            Some(v) => ArchiveStatus::Available(v),
+            None => ArchiveStatus::NotPublished,
+        };
+    }
     if which("rmadison").is_err() {
         return ArchiveStatus::CheckFailed(
             "rmadison not installed (sudo apt install devscripts)".to_owned(),
@@ -345,6 +362,7 @@ pub async fn check_archive(package: &str, release: &str) -> ArchiveStatus {
             }
             Err(e) => return ArchiveStatus::CheckFailed(e.to_string()),
         };
+    cache::store_rmadison(package, &output.stdout);
     match parse_rmadison_version(&output.stdout, release) {
         Some(v) => ArchiveStatus::Available(v),
         None => ArchiveStatus::NotPublished,

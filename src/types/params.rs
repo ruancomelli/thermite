@@ -457,6 +457,48 @@ mod tarball_params_tests {
     }
 }
 
+/// How thermite uses its persistent on-disk caches (currently the `rmadison`
+/// result cache under `~/.cache/canonical/thermite/`).
+///
+/// The variants double as the accepted values of the global `--cache` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CacheMode {
+    /// Use cached results when present; fetch, store, and return on a miss.
+    #[default]
+    On,
+    /// Ignore the cache entirely: always fetch, never read or write entries.
+    Off,
+    /// Always fetch fresh results and overwrite the cached entries.
+    Update,
+    /// Delete the cache directory at startup, then behave like `on`.
+    Clear,
+}
+
+#[cfg(test)]
+mod cache_mode_tests {
+    use super::*;
+    use clap::ValueEnum as _;
+
+    #[test]
+    fn cache_mode_cli_values_match_documented_surface() {
+        let names: Vec<String> = CacheMode::value_variants()
+            .iter()
+            .map(|m| {
+                m.to_possible_value()
+                    .expect("every variant has a possible value")
+                    .get_name()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["on", "off", "update", "clear"]);
+    }
+
+    #[test]
+    fn cache_mode_default_is_on() {
+        assert_eq!(CacheMode::default(), CacheMode::On);
+    }
+}
+
 /// Parameters for the `thermite update` command.
 ///
 /// All values are validated on construction. The short version fields are

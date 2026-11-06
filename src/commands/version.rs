@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::error::{Result, ThermiteError};
 use crate::steps::changelog::read_current_version;
 use crate::types::package_version::RustcPackageVersion;
+use crate::types::ubuntu::{UbuntuRelease, is_known_series};
 use crate::types::versions::RustVersion;
 
 // ---------------------------------------------------------------------------
@@ -118,7 +119,51 @@ pub fn run_bump(input: Option<&str>, operation: &BumpOperation, json: bool) -> R
     let version_str = resolve_version_input(input)?;
     let mut v = RustcPackageVersion::parse(&version_str)?;
 
-    apply_bump_operation(&mut v, operation)?;
+    match operation {
+        BumpOperation::PatchRelease { upstream } => {
+            let new_upstream = RustVersion::parse(upstream)?;
+            v.bump_patch_release(new_upstream);
+        }
+        BumpOperation::UbuntuRevision => {
+            v.bump_ubuntu_revision();
+        }
+        BumpOperation::Repack => {
+            v.bump_repack();
+        }
+        BumpOperation::Backport { series, release } => {
+            let resolved =
+                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
+                    ThermiteError::InvalidRustVersion(
+                        "backport operation requires --series or --release".to_owned(),
+                    )
+                })?;
+            v.to_backport(&resolved);
+        }
+        BumpOperation::BackportRevision => {
+            require_backport(&v)?;
+            v.bump_backport_revision();
+        }
+        BumpOperation::BackportRepack => {
+            require_backport(&v)?;
+            v.bump_backport_repack();
+        }
+        BumpOperation::Retarget { series, release } => {
+            require_backport(&v)?;
+            let resolved =
+                resolve_series(series.as_deref(), release.as_deref())?.ok_or_else(|| {
+                    ThermiteError::InvalidRustVersion(
+                        "retarget operation requires --series or --release".to_owned(),
+                    )
+                })?;
+            v.retarget_series(&resolved);
+        }
+        BumpOperation::Ppa => {
+            v.bump_ppa();
+        }
+        BumpOperation::ClearPpa => {
+            v.clear_ppa();
+        }
+    }
 
     if json {
         let output =
@@ -163,12 +208,46 @@ pub fn resolve_version_input(input: Option<&str>) -> Result<String> {
     }
 }
 
+pub use crate::types::package_version::BumpOperation;
+
 // ---------------------------------------------------------------------------
-// Bump operations (re-exported from types/package_version.rs)
+// Internal helpers
 // ---------------------------------------------------------------------------
 
-pub use crate::types::package_version::BumpOperation;
-use crate::types::package_version::{apply_bump_operation, resolve_series};
+/// Reject bump operations that presuppose an existing backport version.
+fn require_backport(v: &RustcPackageVersion) -> Result<()> {
+    if v.is_backport() {
+        Ok(())
+    } else {
+        Err(ThermiteError::InvalidRustVersion(
+            "operation requires a backport version (one with a '~<series>' suffix); \
+             use 'thermite version bump backport' to create one"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Resolve a series from `--series` or `--release` (mutually exclusive).
+fn resolve_series(series: Option<&str>, release: Option<&str>) -> Result<Option<String>> {
+    match (series, release) {
+        (Some(_), Some(_)) => Err(ThermiteError::InvalidRustVersion(
+            "--series and --release are mutually exclusive".to_owned(),
+        )),
+        (Some(s), None) => {
+            if !is_known_series(s) {
+                return Err(ThermiteError::InvalidRustVersion(format!(
+                    "unknown Ubuntu series '{s}': expected a known series number (e.g. '24.04')"
+                )));
+            }
+            Ok(Some(s.to_owned()))
+        }
+        (None, Some(r)) => {
+            let ubuntu_release = UbuntuRelease::parse(r)?;
+            Ok(Some(ubuntu_release.series_number().to_owned()))
+        }
+        (None, None) => Ok(None),
+    }
+}
 
 /// Print the parsed version in human-readable key-value format.
 fn print_parsed(v: &RustcPackageVersion) {
@@ -343,6 +422,13 @@ mod tests {
     fn resolve_series_unknown_release() {
         let result = resolve_series(None, Some("nonexistent"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_series_rejects_unknown_series_number() {
+        assert!(resolve_series(Some("banana"), None).is_err());
+        assert!(resolve_series(Some("20.4"), None).is_err());
+        assert!(resolve_series(Some(""), None).is_err());
     }
 
     #[test]
@@ -545,6 +631,41 @@ mod tests {
             Some("1.95.0+dfsg-0ubuntu2"),
             &BumpOperation::Backport {
                 series: None,
+                release: None,
+            },
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_backport_revision_requires_backport() {
+        // Without a '~<series>' suffix the bump is a silent no-op; it must
+        // error instead.
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::BackportRevision,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_backport_repack_requires_backport() {
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::BackportRepack,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_bump_retarget_requires_backport() {
+        let result = run_bump(
+            Some("1.95.0+dfsg-0ubuntu1"),
+            &BumpOperation::Retarget {
+                series: Some("22.04".to_owned()),
                 release: None,
             },
             false,

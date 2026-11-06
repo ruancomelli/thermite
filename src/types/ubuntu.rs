@@ -21,6 +21,11 @@ const KNOWN_RELEASES: &[(&str, &str)] = &[
     ("stonking", "26.10"), // 26.10
 ];
 
+/// Whether `s` is the series number of a known Ubuntu release (e.g. `"24.04"`).
+pub fn is_known_series(s: &str) -> bool {
+    KNOWN_RELEASES.iter().any(|(_, series)| *series == s)
+}
+
 /// A validated Ubuntu release adjective (e.g. `"noble"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UbuntuRelease(String);
@@ -298,5 +303,15 @@ mod tests {
             UbuntuRelease::backport_chain(),
             vec!["stonking", "resolute", "noble", "jammy", "focal"]
         );
+    }
+
+    #[test]
+    fn is_known_series_matches_known_releases() {
+        assert!(is_known_series("24.04"));
+        assert!(is_known_series("20.04"));
+        assert!(is_known_series("26.10"));
+        assert!(!is_known_series("banana"));
+        assert!(!is_known_series("20.4"));
+        assert!(!is_known_series(""));
     }
 }
